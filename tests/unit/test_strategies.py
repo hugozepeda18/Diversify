@@ -153,3 +153,13 @@ def test_optimize_skips_invalid_and_reports_train_and_test() -> None:
     assert len(res) == valid * len(DoubleEmaCross.GRID["trend"]) * len(RISK_GRID)
     assert (res["fast"] < res["slow"]).all()
     assert {"train_sharpe_ratio", "test_sharpe_ratio"} <= set(res.columns)
+
+
+@pytest.mark.parametrize("strategy", ALL)
+def test_live_lag0_matches_backtest_next_row(strategy: BaseStrategy) -> None:
+    """Live signal for the just-closed candle t == backtest signal on row t+1 (no 1-bar lag)."""
+    for t in (100, 250, 400):
+        live = strategy.evaluate(NOISE.iloc[: t + 1], lag=0)
+        backtest = strategy.evaluate(NOISE.iloc[: t + 2])
+        assert live.entries.iloc[-1] == backtest.entries.iloc[t + 1]
+        assert live.exits.iloc[-1] == backtest.exits.iloc[t + 1]

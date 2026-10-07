@@ -33,7 +33,7 @@ Rules for the Agent:
   - [x] Write unit tests verifying that position sizes shrink appropriately when the Stop-Loss is wider.
 
 - [ ] **Phase 5: Structured Signal Trigger & Free Alert Dispatcher**
-  - [ ] Build `SignalPayloadBuilder` to assemble complete trade metadata, risk limits, and indicator snapshots into structured JSON.
-  - [ ] Implement `SignalDispatcher`: Telegram Bot API client using `httpx`, with a generic HTTP Webhook POST fallback.
-  - [ ] Add CLI command `test-alert` to verify your receiving endpoint receives the formatted JSON payload.
-  - [ ] Implement live monitoring daemon: loops on candle close -> evaluates strategy -> calculates risk -> saves position to DB -> dispatches JSON alert.
+  - [x] Build `SignalPayloadBuilder` to assemble complete trade metadata, risk limits, and indicator snapshots into structured JSON.
+  - [ ] ~~Implement `SignalDispatcher`~~ (skipped by request: no alerts): Telegram Bot API client using `httpx`, with a generic HTTP Webhook POST fallback.
+  - [ ] ~~Add CLI command `test-alert`~~ (skipped by request: no alerts) to verify your receiving endpoint receives the formatted JSON payload.
+  - [x] Implement live monitoring daemon: loops on candle close -> evaluates strategy -> calculates risk -> saves position to DB -> ~~dispatches JSON alert~~ logs JSON + stores it in `trade_signals`.

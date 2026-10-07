@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import logging
 import signal
 
@@ -12,6 +13,7 @@ from src.core.recovery import load_active_positions
 from src.core.risk import RiskManager
 from src.data.candles import backfill, ingest_live, load_candles
 from src.data.gateway import ExchangeGateway
+from src.signals import process_close
 from src.strategies import STRATEGIES
 
 log = logging.getLogger("trading-bot")
@@ -25,22 +27,6 @@ async def startup() -> None:
     log.info("recovered %d active position(s)", len(positions))
     for (strategy, symbol, timeframe), p in positions.items():
         log.info("  %s %s %s %s @ %s", strategy, symbol, timeframe, p.side, p.entry_price)
-
-
-async def on_candle_close(symbol: str, timeframe: str, closed: pd.DataFrame) -> None:
-    # TODO(Phase 5): evaluate -> risk -> save position -> dispatch. Timing gotcha: evaluate()
-    # shifts indicators, so row t holds the signal computed from data through t-1. For the
-    # candle that just closed (t) call `strategy.triggers(strategy.indicators(candles))`
-    # (unshifted) and read its last row, or every alert fires one bar late. Size with
-    # `RiskManager.plan(entry=gw.prices[symbol], atr=risk.atr(candles).iloc[-1], equity=...)`,
-    # entry being the next bar's open ~ live price, same as the backtest.
-    log.info(
-        "%s %s closed %d candle(s), last close %s",
-        symbol,
-        timeframe,
-        len(closed),
-        closed["close"].iloc[-1],
-    )
 
 
 async def run_backfill(symbol: str, timeframe: str, days: int) -> None:
@@ -89,12 +75,41 @@ async def run_optimize_cmd(args: argparse.Namespace) -> None:
         print(res[show].head(args.top).round(2).to_string(index=False))
 
 
-async def run_monitor(symbol: str, timeframe: str, days: int) -> None:
+async def run_monitor(args: argparse.Namespace) -> None:
+    symbol, timeframe = args.symbol, args.timeframe
+    strategy = STRATEGIES[args.strategy]()
+    risk = RiskManager(risk_pct=settings.risk_per_trade)
     await startup()
     gw = ExchangeGateway()
+
+    async def on_candle_close(symbol: str, timeframe: str, closed: pd.DataFrame) -> None:
+        log.info("%s %s closed @ %s", symbol, timeframe, closed["close"].iloc[-1])
+        try:
+            async with SessionLocal() as session:
+                candles = await load_candles(session, symbol, timeframe, args.days)
+                price = gw.prices.get(symbol, float(candles["close"].iloc[-1]))
+                payload = await process_close(
+                    session,
+                    strategy,
+                    risk,
+                    symbol,
+                    timeframe,
+                    candles,
+                    price,
+                    settings.account_equity_usd,
+                )
+        except Exception:  # a bad candle must not kill ingestion; the next close retries
+            log.exception("signal evaluation failed for %s %s", symbol, timeframe)
+            return
+        if payload:
+            # ponytail: alert dispatch (Telegram/webhook) skipped by request; signal is in
+            # trade_signals and the log. Plug a dispatcher in here when wanted.
+            log.info("SIGNAL %s", json.dumps(payload))
+
+    log.info("monitoring %s %s with %s %s", symbol, timeframe, strategy.name, strategy.params())
     try:
         async with SessionLocal() as session:
-            await backfill(gw, session, symbol, timeframe, days)  # fill any gap since last run
+            await backfill(gw, session, symbol, timeframe, args.days)  # fill gap since last run
         async with asyncio.TaskGroup() as tg:
             tg.create_task(gw.stream_prices(symbol))
             tg.create_task(ingest_live(gw, SessionLocal, symbol, timeframe, on_candle_close))
@@ -118,7 +133,7 @@ async def _run(args: argparse.Namespace) -> None:
         elif args.command == "optimize":
             await run_optimize_cmd(args)
         elif args.command == "monitor":
-            await run_monitor(args.symbol, args.timeframe, args.days)
+            await run_monitor(args)
     finally:
         await engine.dispose()
 
@@ -152,10 +167,11 @@ def main() -> None:
         "--min-trades", type=int, default=20, help="Drop combos with fewer train trades"
     )
     op.add_argument("--top", type=int, default=10)
-    mon = sub.add_parser("monitor", help="Stream live candles into the DB")
+    mon = sub.add_parser("monitor", help="Live signal engine: candles -> strategy -> risk -> DB")
+    mon.add_argument("--strategy", choices=STRATEGIES, default="DoubleEmaCross")
     mon.add_argument("--symbol", default="BTC/USDT")
-    mon.add_argument("--timeframe", default="15m")
-    mon.add_argument("--days", type=int, default=60, help="Backfill depth if DB is empty")
+    mon.add_argument("--timeframe", default="4h")
+    mon.add_argument("--days", type=int, default=365, help="History loaded for indicator warm-up")
     try:
         asyncio.run(_run(parser.parse_args()))
     except (KeyboardInterrupt, asyncio.CancelledError):

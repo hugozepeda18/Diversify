@@ -24,8 +24,9 @@ class RiskManager:
 
     risk_pct: float = 0.01
     atr_window: int = 14
-    atr_mult: float = 2.0  # stop distance = atr_mult * ATR
-    reward_ratio: float = 2.0  # TP distance = reward_ratio * stop distance
+    # Wide stop + far TP ("let winners run") won across strategies/timeframes in `optimize`.
+    atr_mult: float = 5.0  # stop distance = atr_mult * ATR
+    reward_ratio: float = 10.0  # TP distance = reward_ratio * stop distance
 
     def atr(self, candles: pd.DataFrame) -> pd.Series:
         """ATR through each bar's close (unshifted; the caller decides when it is known)."""

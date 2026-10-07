@@ -36,15 +36,21 @@ class BaseStrategy(ABC):
     def triggers(self, ind: pd.DataFrame) -> Signals:
         """Boolean entry/exit Series computed from already-shifted indicators."""
 
-    def evaluate(self, candles: pd.DataFrame) -> Signals:
+    def frame(self, candles: pd.DataFrame) -> pd.DataFrame:
+        """Unshifted indicators plus the trend-filter columns; also the live snapshot source."""
         ind = self.indicators(candles)
         if self.trend:
             close = candles["close"]
-            ind = ind.assign(_close=close, _trend=vbt.MA.run(close, self.trend, ewm=True).ma)
-        ind = ind.shift(1)
+            ind = ind.assign(close=close, ema_trend=vbt.MA.run(close, self.trend, ewm=True).ma)
+        return ind
+
+    def evaluate(self, candles: pd.DataFrame, lag: int = 1) -> Signals:
+        """lag=1 (default) for backtests. lag=0 is for live use only: its last row is the
+        signal for the bar *after* the newest closed candle, i.e. evaluate()'s next row."""
+        ind = self.frame(candles).shift(lag)
         entries, exits = self.triggers(ind)
         if self.trend:
-            entries = entries & (ind["_close"] > ind["_trend"])
+            entries = entries & (ind["close"] > ind["ema_trend"])
         # NaN warm-up rows compare as False, but make it explicit and typed.
         return Signals(entries.fillna(False).astype(bool), exits.fillna(False).astype(bool))
 
@@ -57,7 +63,8 @@ class DoubleEmaCross(BaseStrategy):
         "trend": [0, 200],
     }
 
-    def __init__(self, fast: int = 12, slow: int = 26, trend: int = 0) -> None:
+    # Defaults from `optimize` (4h, train 2022-10..2024, test 2025-): robust plateau around 20/200.
+    def __init__(self, fast: int = 20, slow: int = 200, trend: int = 0) -> None:
         if fast >= slow:
             raise ValueError(f"fast ({fast}) must be < slow ({slow})")
         self.fast, self.slow, self.trend = fast, slow, trend

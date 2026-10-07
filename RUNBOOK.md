@@ -50,9 +50,9 @@ python -m src.main backtest --symbol BTC/USDT --timeframe 1h --days 1460
 #     Pick a plateau that holds in test, not the single best train row.
 python -m src.main optimize --strategy DoubleEmaCross --timeframe 15m 1h 4h 1d --split 2025-01-01
 
-# 2. Test the Signal Dispatcher (Sends a mock JSON trade payload to your Telegram/Webhook)
-python -m src.main test-alert
+# 2. (Alert dispatcher / test-alert: not built — alerts skipped by request.)
 
-# 3. Start Live Candle Ingestion & Signal Generator
-python -m src.main monitor --symbol BTC/USDT --timeframe 15m
+# 3. Start live ingestion + signal engine (defaults: DoubleEmaCross 20/200, 4h, 5xATR SL, 10R TP).
+#    Signals are logged as "SIGNAL {json}" and stored in trade_signals; open trades in active_positions.
+python -m src.main monitor --symbol BTC/USDT --timeframe 4h
 ```
