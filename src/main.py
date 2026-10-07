@@ -1,17 +1,22 @@
 import argparse
 import asyncio
 import logging
+import signal
 
 import pandas as pd
 
 from src.backtest import run_backtest
+from src.core.config import settings
 from src.core.db import SessionLocal, engine
 from src.core.recovery import load_active_positions
+from src.core.risk import RiskManager
 from src.data.candles import backfill, ingest_live, load_candles
 from src.data.gateway import ExchangeGateway
 from src.strategies import STRATEGIES
 
 log = logging.getLogger("trading-bot")
+# ~4 years: spans the 2022 bear, 2023 chop and 2024-25 bull, so a strategy is judged across regimes.
+HISTORY_DAYS = 1460
 
 
 async def startup() -> None:
@@ -23,7 +28,12 @@ async def startup() -> None:
 
 
 async def on_candle_close(symbol: str, timeframe: str, closed: pd.DataFrame) -> None:
-    # ponytail: Phase 3 strategy engine plugs in here.
+    # TODO(Phase 5): evaluate -> risk -> save position -> dispatch. Timing gotcha: evaluate()
+    # shifts indicators, so row t holds the signal computed from data through t-1. For the
+    # candle that just closed (t) call `strategy.triggers(strategy.indicators(candles))`
+    # (unshifted) and read its last row, or every alert fires one bar late. Size with
+    # `RiskManager.plan(entry=gw.prices[symbol], atr=risk.atr(candles).iloc[-1], equity=...)`,
+    # entry being the next bar's open ~ live price, same as the backtest.
     log.info(
         "%s %s closed %d candle(s), last close %s",
         symbol,
@@ -47,8 +57,10 @@ async def run_backtest_cmd(args: argparse.Namespace) -> None:
     async with SessionLocal() as session:
         candles = await load_candles(session, args.symbol, args.timeframe, args.days)
     strategy = STRATEGIES[args.strategy]()
-    metrics = run_backtest(strategy, candles, args.timeframe, fees=args.fees)
-    print(f"\n{strategy.name} | {args.symbol} {args.timeframe} | {len(candles)} candles")
+    risk = None if args.no_risk else RiskManager(risk_pct=settings.risk_per_trade)
+    metrics = run_backtest(strategy, candles, args.timeframe, fees=args.fees, risk=risk)
+    mode = "no stops, all-in" if risk is None else f"ATR stops, {risk.risk_pct:.1%} risk/trade"
+    print(f"\n{strategy.name} | {args.symbol} {args.timeframe} | {len(candles)} candles | {mode}")
     print(f"{candles.index[0]} -> {candles.index[-1]}")
     for key, value in metrics.items():
         print(f"  {key:<18} {value:>10.2f}")
@@ -68,6 +80,10 @@ async def run_monitor(symbol: str, timeframe: str, days: int) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    # SIGTERM (docker stop, kill) cancels like Ctrl-C so the finally blocks close sockets/DB.
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
     try:
         if args.command == "recover":
             await startup()
@@ -92,12 +108,13 @@ def main() -> None:
     bf = sub.add_parser("backfill", help="Seed historical candles via REST")
     bf.add_argument("--symbol", default="BTC/USDT")
     bf.add_argument("--timeframe", nargs="+", default=["15m", "1h"])
-    bf.add_argument("--days", type=int, default=60)
+    bf.add_argument("--days", type=int, default=HISTORY_DAYS)
     bt = sub.add_parser("backtest", help="Backtest a strategy on stored candles")
     bt.add_argument("--strategy", choices=STRATEGIES, default="DoubleEma")
     bt.add_argument("--symbol", default="BTC/USDT")
     bt.add_argument("--timeframe", default="1h")
-    bt.add_argument("--days", type=int, default=60)
+    bt.add_argument("--days", type=int, default=HISTORY_DAYS)
+    bt.add_argument("--no-risk", action="store_true", help="Disable SL/TP and risk sizing")
     bt.add_argument("--fees", type=float, default=0.001, help="Fee per fill (0.001 = 0.1%%)")
     mon = sub.add_parser("monitor", help="Stream live candles into the DB")
     mon.add_argument("--symbol", default="BTC/USDT")
@@ -105,8 +122,8 @@ def main() -> None:
     mon.add_argument("--days", type=int, default=60, help="Backfill depth if DB is empty")
     try:
         asyncio.run(_run(parser.parse_args()))
-    except KeyboardInterrupt:
-        pass
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        log.info("shut down")
 
 
 if __name__ == "__main__":

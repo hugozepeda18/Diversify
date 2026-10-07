@@ -40,10 +40,11 @@ ruff check .
 ## 4. Operational Commands
 ```bash
 # 0. Seed historical 15m + 1h candles from Binance (resumes from the newest stored candle)
-python -m src.main backfill --symbol BTC/USDT --days 60
+python -m src.main backfill --symbol BTC/USDT --days 1460   # ~4y, ~2 min first run
 
-# 1. Backtest a strategy with VectorBT
-python -m src.main backtest --symbol BTC/USDT --timeframe 1h --days 60
+# 1. Backtest with VectorBT (ATR SL/TP + 1% risk sizing; --no-risk for all-in, no stops).
+#    Judge per-year with --days 365 too, and always against buy_hold_return_pct.
+python -m src.main backtest --symbol BTC/USDT --timeframe 1h --days 1460
 
 # 2. Test the Signal Dispatcher (Sends a mock JSON trade payload to your Telegram/Webhook)
 python -m src.main test-alert

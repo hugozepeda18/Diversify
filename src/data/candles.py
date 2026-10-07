@@ -119,6 +119,21 @@ def split_closed(
     return closed, merged[merged["timestamp"] == live]
 
 
+async def _finalize(
+    gw: ExchangeGateway, closed: pd.DataFrame, symbol: str, timeframe: str
+) -> pd.DataFrame:
+    """Swap WS snapshots of closed candles for REST finals (the last WS tick may miss trades)."""
+    since = int(closed["timestamp"].iloc[0].timestamp() * 1000)
+    try:
+        page = await gw.fetch_ohlcv(symbol, timeframe, since, len(closed))
+    except Exception:  # keep the WS version rather than lose the candle
+        log.exception("REST final fetch failed for %s %s, keeping WS values", symbol, timeframe)
+        return closed
+    final = to_frame(page, symbol, timeframe)
+    final = final[final["timestamp"].isin(closed["timestamp"])]
+    return final if len(final) == len(closed) else closed
+
+
 async def ingest_live(
     gw: ExchangeGateway,
     sessions: async_sessionmaker[AsyncSession],
@@ -138,11 +153,10 @@ async def ingest_live(
             log.exception("ohlcv stream error for %s %s, retrying", symbol, timeframe)
             await asyncio.sleep(1)
             continue
-        # ponytail: closed candle = last WS version seen; Binance sends the final (x=true) kline
-        # before the next one opens. Re-fetch via REST here if exact finals ever mismatch.
         closed, pending = split_closed(pending, to_frame(ohlcv, symbol, timeframe), last_closed)
         if closed.empty:
             continue
+        closed = await _finalize(gw, closed, symbol, timeframe)
         async with sessions() as session:
             await upsert_candles(session, closed)
             await session.commit()

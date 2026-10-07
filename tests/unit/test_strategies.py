@@ -85,9 +85,19 @@ def test_backtest_metrics() -> None:
         "max_drawdown_pct",
         "win_rate_pct",
         "trades",
+        "buy_hold_return_pct",
     }
     assert m["trades"] == 1 and m["total_return_pct"] > 0
 
 
 def test_cli_alias() -> None:
     assert STRATEGIES["DoubleEma"] is DoubleEmaCross
+
+
+def test_backtest_with_risk_stops_out_trades() -> None:
+    from src.core.risk import RiskManager
+
+    plain = run_backtest(RsiThreshold(), NOISE, "1h")
+    risked = run_backtest(RsiThreshold(), NOISE, "1h", risk=RiskManager())
+    assert risked["trades"] >= plain["trades"]  # stops close trades early, freeing re-entries
+    assert risked["max_drawdown_pct"] >= plain["max_drawdown_pct"]  # smaller size, shallower DD

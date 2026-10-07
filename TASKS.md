@@ -27,10 +27,10 @@ Rules for the Agent:
   - [x] Build the Backtest CLI runner to output `vectorbt` metrics over historical data (Sharpe ratio, Max Drawdown, Total Return, Win Rate).
   - [x] Write unit tests verifying that strategy buy/sell triggers produce correct boolean signal arrays.
 
-- [ ] **Phase 4: Risk Management & Dynamic Execution**
-  - [ ] Build `RiskManager`: Calculate dynamic position sizes based on a 1% account equity risk parameter.
-  - [ ] Implement Hard Stops: Ensure the `RiskManager` calculates absolute price targets for Stop-Loss and Take-Profit for every entry.
-  - [ ] Write unit tests verifying that position sizes shrink appropriately when the Stop-Loss is wider.
+- [x] **Phase 4: Risk Management & Dynamic Execution**
+  - [x] Build `RiskManager`: Calculate dynamic position sizes based on a 1% account equity risk parameter.
+  - [x] Implement Hard Stops: Ensure the `RiskManager` calculates absolute price targets for Stop-Loss and Take-Profit for every entry.
+  - [x] Write unit tests verifying that position sizes shrink appropriately when the Stop-Loss is wider.
 
 - [ ] **Phase 5: Structured Signal Trigger & Free Alert Dispatcher**
   - [ ] Build `SignalPayloadBuilder` to assemble complete trade metadata, risk limits, and indicator snapshots into structured JSON.

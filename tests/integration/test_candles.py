@@ -62,3 +62,41 @@ async def test_backfill_extends_history_backwards(session: AsyncSession) -> None
     assert await _count(session) == 10 * 24 - 1
     await backfill(gw, session, SYM, TF, days=50)  # type: ignore[arg-type]
     assert await _count(session) == 50 * 24 - 1
+
+
+class Stop(BaseException):
+    pass
+
+
+async def test_ingest_live_persists_rest_final_not_ws_snapshot(session: AsyncSession) -> None:
+    from contextlib import asynccontextmanager
+
+    from src.data.candles import ingest_live
+
+    t0 = 1_700_000_000_000
+    ws = iter([[[t0, 1, 2, 0.5, 1.5, 10]], [[t0 + HOUR, 1.5, 2, 1, 1.6, 1]]])
+
+    class LiveGateway:
+        async def watch_ohlcv(self, symbol: str, timeframe: str) -> Any:
+            return next(ws)
+
+        async def fetch_ohlcv(self, symbol: str, timeframe: str, since: int, limit: int) -> Any:
+            return [[t0, 1, 2.5, 0.5, 1.4, 11]]  # final differs from the last WS tick
+
+    @asynccontextmanager
+    async def sessions() -> Any:
+        yield session
+
+    seen: list[float] = []
+
+    async def on_close(symbol: str, timeframe: str, closed: Any) -> None:
+        seen.extend(closed["close"])
+        raise Stop
+
+    try:
+        await ingest_live(LiveGateway(), sessions, SYM, TF, on_close)  # type: ignore[arg-type]
+    except Stop:
+        pass
+    row = await session.scalar(select(MarketCandle).where(MarketCandle.symbol == SYM))
+    assert row is not None and row.close == Decimal("1.4") and row.high == Decimal("2.5")
+    assert seen == [1.4]
