@@ -3,7 +3,13 @@ import pandas as pd
 import pytest
 
 from src.backtest import run_backtest
-from src.strategies import STRATEGIES, BaseStrategy, DoubleEmaCross, RsiThreshold
+from src.strategies import (
+    STRATEGIES,
+    BaseStrategy,
+    DonchianBreakout,
+    DoubleEmaCross,
+    RsiThreshold,
+)
 
 
 def candles(close: np.ndarray) -> pd.DataFrame:
@@ -57,7 +63,17 @@ def test_rsi_v_shape_enters_on_dip_exits_on_rally() -> None:
     assert not (entries & exits).any()
 
 
-@pytest.mark.parametrize("strategy", [DoubleEmaCross(), RsiThreshold()])
+ALL = [
+    DoubleEmaCross(),
+    DoubleEmaCross(trend=50),
+    RsiThreshold(),
+    RsiThreshold(trend=50),
+    DonchianBreakout(),
+    DonchianBreakout(trend=0),
+]
+
+
+@pytest.mark.parametrize("strategy", ALL)
 def test_signals_are_clean_boolean_arrays(strategy: BaseStrategy) -> None:
     for sig in strategy.evaluate(NOISE):
         assert sig.dtype == bool
@@ -65,7 +81,7 @@ def test_signals_are_clean_boolean_arrays(strategy: BaseStrategy) -> None:
         assert not sig.iloc[0]  # no data before row 0 -> no signal
 
 
-@pytest.mark.parametrize("strategy", [DoubleEmaCross(), RsiThreshold()])
+@pytest.mark.parametrize("strategy", ALL)
 def test_no_look_ahead(strategy: BaseStrategy) -> None:
     """Changing candle t must not change any signal at rows <= t."""
     base = strategy.evaluate(NOISE)
@@ -101,3 +117,39 @@ def test_backtest_with_risk_stops_out_trades() -> None:
     risked = run_backtest(RsiThreshold(), NOISE, "1h", risk=RiskManager())
     assert risked["trades"] >= plain["trades"]  # stops close trades early, freeing re-entries
     assert risked["max_drawdown_pct"] >= plain["max_drawdown_pct"]  # smaller size, shallower DD
+
+
+def test_donchian_v_shape_breaks_out_after_bottom() -> None:
+    entries, exits = DonchianBreakout(entry=20, exit=10, trend=0).evaluate(V)
+    first = V.index.get_loc(entries.idxmax())
+    assert 60 < first and entries.iloc[first:].all()  # every bar of the rally makes a new high
+    assert exits.iloc[11:60].all() and not exits.iloc[61:].any()  # new lows only in the decline
+
+
+def test_trend_filter_only_gates_entries() -> None:
+    plain, gated = RsiThreshold().evaluate(NOISE), RsiThreshold(trend=50).evaluate(NOISE)
+    assert gated.entries.sum() < plain.entries.sum()
+    assert not (gated.entries & ~plain.entries).any()  # never adds entries
+    assert gated.exits.equals(plain.exits)
+
+
+def test_backtest_window_does_not_leak_future() -> None:
+    from src.core.risk import RiskManager
+
+    split = str(NOISE.index[300])
+    shocked = NOISE.copy()
+    shocked.iloc[300:] *= 3  # rewrite everything from the split on
+    for risk in (None, RiskManager()):
+        a = run_backtest(RsiThreshold(), NOISE, "1h", risk=risk, end=split)
+        b = run_backtest(RsiThreshold(), shocked, "1h", risk=risk, end=split)
+        assert a == b
+
+
+def test_optimize_skips_invalid_and_reports_train_and_test() -> None:
+    from src.backtest import RISK_GRID, optimize
+
+    res = optimize(DoubleEmaCross, NOISE, "1h", str(NOISE.index[300]), 0.001)
+    valid = sum(f < s for f in DoubleEmaCross.GRID["fast"] for s in DoubleEmaCross.GRID["slow"])
+    assert len(res) == valid * len(DoubleEmaCross.GRID["trend"]) * len(RISK_GRID)
+    assert (res["fast"] < res["slow"]).all()
+    assert {"train_sharpe_ratio", "test_sharpe_ratio"} <= set(res.columns)

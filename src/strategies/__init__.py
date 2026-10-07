@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import pandas as pd
 import vectorbt as vbt
@@ -22,6 +22,11 @@ class BaseStrategy(ABC):
     """
 
     name: str
+    GRID: ClassVar[dict[str, list[float]]] = {}  # parameter search space for `optimize`
+    trend: int = 0  # EMA window; entries only while close is above it (0 = off)
+
+    def params(self) -> dict[str, float]:
+        return {k: getattr(self, k) for k in self.GRID}
 
     @abstractmethod
     def indicators(self, candles: pd.DataFrame) -> pd.DataFrame:
@@ -32,16 +37,30 @@ class BaseStrategy(ABC):
         """Boolean entry/exit Series computed from already-shifted indicators."""
 
     def evaluate(self, candles: pd.DataFrame) -> Signals:
-        entries, exits = self.triggers(self.indicators(candles).shift(1))
+        ind = self.indicators(candles)
+        if self.trend:
+            close = candles["close"]
+            ind = ind.assign(_close=close, _trend=vbt.MA.run(close, self.trend, ewm=True).ma)
+        ind = ind.shift(1)
+        entries, exits = self.triggers(ind)
+        if self.trend:
+            entries = entries & (ind["_close"] > ind["_trend"])
         # NaN warm-up rows compare as False, but make it explicit and typed.
         return Signals(entries.fillna(False).astype(bool), exits.fillna(False).astype(bool))
 
 
 class DoubleEmaCross(BaseStrategy):
     name = "DoubleEmaCross"
+    GRID: ClassVar[dict[str, list[float]]] = {
+        "fast": [10, 20, 50],
+        "slow": [26, 50, 100, 200],
+        "trend": [0, 200],
+    }
 
-    def __init__(self, fast: int = 12, slow: int = 26) -> None:
-        self.fast, self.slow = fast, slow
+    def __init__(self, fast: int = 12, slow: int = 26, trend: int = 0) -> None:
+        if fast >= slow:
+            raise ValueError(f"fast ({fast}) must be < slow ({slow})")
+        self.fast, self.slow, self.trend = fast, slow, trend
 
     def indicators(self, candles: pd.DataFrame) -> pd.DataFrame:
         close = candles["close"]
@@ -63,9 +82,16 @@ class RsiThreshold(BaseStrategy):
     """Enter when RSI dips below `lower` (oversold), exit when it rises above `upper`."""
 
     name = "RsiThreshold"
+    GRID: ClassVar[dict[str, list[float]]] = {
+        "lower": [25, 30, 35, 40],
+        "upper": [60, 70, 80],
+        "trend": [0, 200],
+    }
 
-    def __init__(self, window: int = 14, lower: float = 30, upper: float = 70) -> None:
-        self.window, self.lower, self.upper = window, lower, upper
+    def __init__(
+        self, window: int = 14, lower: float = 30, upper: float = 70, trend: int = 0
+    ) -> None:
+        self.window, self.lower, self.upper, self.trend = window, lower, upper, trend
 
     def indicators(self, candles: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame({"rsi": vbt.RSI.run(candles["close"], self.window).rsi})
@@ -74,8 +100,37 @@ class RsiThreshold(BaseStrategy):
         return Signals(ind["rsi"] < self.lower, ind["rsi"] > self.upper)
 
 
+class DonchianBreakout(BaseStrategy):
+    """Enter on a close above the prior `entry`-bar high; exit on a close below the prior
+    `exit`-bar low (Turtle-style trend following)."""
+
+    name = "DonchianBreakout"
+    GRID: ClassVar[dict[str, list[float]]] = {
+        "entry": [20, 50, 100],
+        "exit": [10, 20, 50],
+        "trend": [0, 200],
+    }
+
+    def __init__(self, entry: int = 20, exit: int = 20, trend: int = 200) -> None:
+        self.entry, self.exit, self.trend = entry, exit, trend
+
+    def indicators(self, candles: pd.DataFrame) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "close": candles["close"],
+                # Channels exclude the current bar, else close > high-incl-close never fires.
+                "upper": candles["high"].rolling(self.entry).max().shift(1),
+                "lower": candles["low"].rolling(self.exit).min().shift(1),
+            }
+        )
+
+    def triggers(self, ind: pd.DataFrame) -> Signals:
+        return Signals(ind["close"] > ind["upper"], ind["close"] < ind["lower"])
+
+
 STRATEGIES: dict[str, type[BaseStrategy]] = {
     "DoubleEma": DoubleEmaCross,  # short alias used in CLAUDE.md
     "DoubleEmaCross": DoubleEmaCross,
     "RsiThreshold": RsiThreshold,
+    "DonchianBreakout": DonchianBreakout,
 }

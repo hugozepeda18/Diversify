@@ -46,6 +46,10 @@ python -m src.main backfill --symbol BTC/USDT --days 1460   # ~4y, ~2 min first 
 #    Judge per-year with --days 365 too, and always against buy_hold_return_pct.
 python -m src.main backtest --symbol BTC/USDT --timeframe 1h --days 1460
 
+# 1b. Parameter search: fit on data before --split, report out-of-sample after it.
+#     Pick a plateau that holds in test, not the single best train row.
+python -m src.main optimize --strategy DoubleEmaCross --timeframe 15m 1h 4h 1d --split 2025-01-01
+
 # 2. Test the Signal Dispatcher (Sends a mock JSON trade payload to your Telegram/Webhook)
 python -m src.main test-alert
 

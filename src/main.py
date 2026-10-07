@@ -5,7 +5,7 @@ import signal
 
 import pandas as pd
 
-from src.backtest import run_backtest
+from src.backtest import optimize, run_backtest
 from src.core.config import settings
 from src.core.db import SessionLocal, engine
 from src.core.recovery import load_active_positions
@@ -66,6 +66,29 @@ async def run_backtest_cmd(args: argparse.Namespace) -> None:
         print(f"  {key:<18} {value:>10.2f}")
 
 
+async def run_optimize_cmd(args: argparse.Namespace) -> None:
+    cols = ["sharpe_ratio", "total_return_pct", "max_drawdown_pct", "trades"]
+    for tf in args.timeframe:
+        await run_backfill(args.symbol, tf, args.days)
+        async with SessionLocal() as session:
+            candles = await load_candles(session, args.symbol, tf, args.days)
+        res = optimize(STRATEGIES[args.strategy], candles, tf, args.split, args.fees)
+        bh = {w: res[f"{w}_buy_hold_return_pct"].iloc[0] for w in ("train", "test")}
+        print(
+            f"\n{args.strategy} | {args.symbol} {tf} | train < {args.split} <= test | "
+            f"buy&hold train {bh['train']:.1f}% test {bh['test']:.1f}%"
+        )
+        res = res[res["train_trades"] >= args.min_trades]
+        if res.empty:
+            print(f"  no combo made >= {args.min_trades} train trades (lower --min-trades)")
+            continue
+        show = [c for c in res.columns if not c.endswith(("buy_hold_return_pct", "win_rate_pct"))]
+        show = [c for c in show if not c.startswith(("train_", "test_"))] + [
+            f"{w}_{c}" for w in ("train", "test") for c in cols
+        ]
+        print(res[show].head(args.top).round(2).to_string(index=False))
+
+
 async def run_monitor(symbol: str, timeframe: str, days: int) -> None:
     await startup()
     gw = ExchangeGateway()
@@ -92,6 +115,8 @@ async def _run(args: argparse.Namespace) -> None:
                 await run_backfill(args.symbol, tf, args.days)
         elif args.command == "backtest":
             await run_backtest_cmd(args)
+        elif args.command == "optimize":
+            await run_optimize_cmd(args)
         elif args.command == "monitor":
             await run_monitor(args.symbol, args.timeframe, args.days)
     finally:
@@ -116,6 +141,17 @@ def main() -> None:
     bt.add_argument("--days", type=int, default=HISTORY_DAYS)
     bt.add_argument("--no-risk", action="store_true", help="Disable SL/TP and risk sizing")
     bt.add_argument("--fees", type=float, default=0.001, help="Fee per fill (0.001 = 0.1%%)")
+    op = sub.add_parser("optimize", help="Grid-search params on train, report on test")
+    op.add_argument("--strategy", choices=STRATEGIES, default="DonchianBreakout")
+    op.add_argument("--symbol", default="BTC/USDT")
+    op.add_argument("--timeframe", nargs="+", default=["15m", "1h", "4h", "1d"])
+    op.add_argument("--days", type=int, default=HISTORY_DAYS)
+    op.add_argument("--split", default="2025-01-01", help="Train before, test from this date")
+    op.add_argument("--fees", type=float, default=0.001)
+    op.add_argument(
+        "--min-trades", type=int, default=20, help="Drop combos with fewer train trades"
+    )
+    op.add_argument("--top", type=int, default=10)
     mon = sub.add_parser("monitor", help="Stream live candles into the DB")
     mon.add_argument("--symbol", default="BTC/USDT")
     mon.add_argument("--timeframe", default="15m")
