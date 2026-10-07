@@ -20,12 +20,12 @@ Rules for the Agent:
   - [x] Implement live ingestion loop using `ccxt.watch_ohlcv()` to listen for candle closes, persist them to TimescaleDB, and trigger the Strategy Engine.
   - [x] Write integration test verifying candles are correctly written and deduplicated in TimescaleDB.
 
-- [ ] **Phase 3: Vectorized Strategy Engine**
-  - [ ] Define `BaseStrategy` abstract interface with vectorized evaluation logic.
-  - [ ] Implement `DoubleEmaCross` and `RsiThreshold` strategies using `vectorbt` indicators.
-  - [ ] Eliminate Look-Ahead Bias: Implement strict `.shift(1)` logic on indicator arrays inside the strategy evaluator.
-  - [ ] Build the Backtest CLI runner to output `vectorbt` metrics over historical data (Sharpe ratio, Max Drawdown, Total Return, Win Rate).
-  - [ ] Write unit tests verifying that strategy buy/sell triggers produce correct boolean signal arrays.
+- [x] **Phase 3: Vectorized Strategy Engine**
+  - [x] Define `BaseStrategy` abstract interface with vectorized evaluation logic.
+  - [x] Implement `DoubleEmaCross` and `RsiThreshold` strategies using `vectorbt` indicators.
+  - [x] Eliminate Look-Ahead Bias: Implement strict `.shift(1)` logic on indicator arrays inside the strategy evaluator.
+  - [x] Build the Backtest CLI runner to output `vectorbt` metrics over historical data (Sharpe ratio, Max Drawdown, Total Return, Win Rate).
+  - [x] Write unit tests verifying that strategy buy/sell triggers produce correct boolean signal arrays.
 
 - [ ] **Phase 4: Risk Management & Dynamic Execution**
   - [ ] Build `RiskManager`: Calculate dynamic position sizes based on a 1% account equity risk parameter.

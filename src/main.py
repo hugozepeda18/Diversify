@@ -4,10 +4,12 @@ import logging
 
 import pandas as pd
 
+from src.backtest import run_backtest
 from src.core.db import SessionLocal, engine
 from src.core.recovery import load_active_positions
-from src.data.candles import backfill, ingest_live
+from src.data.candles import backfill, ingest_live, load_candles
 from src.data.gateway import ExchangeGateway
+from src.strategies import STRATEGIES
 
 log = logging.getLogger("trading-bot")
 
@@ -40,6 +42,18 @@ async def run_backfill(symbol: str, timeframe: str, days: int) -> None:
         await gw.close()
 
 
+async def run_backtest_cmd(args: argparse.Namespace) -> None:
+    await run_backfill(args.symbol, args.timeframe, args.days)  # make sure history is present
+    async with SessionLocal() as session:
+        candles = await load_candles(session, args.symbol, args.timeframe, args.days)
+    strategy = STRATEGIES[args.strategy]()
+    metrics = run_backtest(strategy, candles, args.timeframe, fees=args.fees)
+    print(f"\n{strategy.name} | {args.symbol} {args.timeframe} | {len(candles)} candles")
+    print(f"{candles.index[0]} -> {candles.index[-1]}")
+    for key, value in metrics.items():
+        print(f"  {key:<18} {value:>10.2f}")
+
+
 async def run_monitor(symbol: str, timeframe: str, days: int) -> None:
     await startup()
     gw = ExchangeGateway()
@@ -60,6 +74,8 @@ async def _run(args: argparse.Namespace) -> None:
         elif args.command == "backfill":
             for tf in args.timeframe:
                 await run_backfill(args.symbol, tf, args.days)
+        elif args.command == "backtest":
+            await run_backtest_cmd(args)
         elif args.command == "monitor":
             await run_monitor(args.symbol, args.timeframe, args.days)
     finally:
@@ -77,6 +93,12 @@ def main() -> None:
     bf.add_argument("--symbol", default="BTC/USDT")
     bf.add_argument("--timeframe", nargs="+", default=["15m", "1h"])
     bf.add_argument("--days", type=int, default=60)
+    bt = sub.add_parser("backtest", help="Backtest a strategy on stored candles")
+    bt.add_argument("--strategy", choices=STRATEGIES, default="DoubleEma")
+    bt.add_argument("--symbol", default="BTC/USDT")
+    bt.add_argument("--timeframe", default="1h")
+    bt.add_argument("--days", type=int, default=60)
+    bt.add_argument("--fees", type=float, default=0.001, help="Fee per fill (0.001 = 0.1%%)")
     mon = sub.add_parser("monitor", help="Stream live candles into the DB")
     mon.add_argument("--symbol", default="BTC/USDT")
     mon.add_argument("--timeframe", default="15m")

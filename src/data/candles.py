@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 import pandas as pd
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -40,11 +40,29 @@ async def upsert_candles(session: AsyncSession, df: pd.DataFrame) -> None:
     await session.execute(stmt)
 
 
+def _where(symbol: str, timeframe: str) -> tuple[ColumnElement[bool], ...]:
+    return (MarketCandle.symbol == symbol, MarketCandle.timeframe == timeframe)
+
+
 async def latest_timestamp(session: AsyncSession, symbol: str, timeframe: str) -> datetime | None:
-    q = select(func.max(MarketCandle.timestamp)).where(
-        MarketCandle.symbol == symbol, MarketCandle.timeframe == timeframe
+    return await session.scalar(
+        select(func.max(MarketCandle.timestamp)).where(*_where(symbol, timeframe))
     )
-    return await session.scalar(q)
+
+
+async def load_candles(
+    session: AsyncSession, symbol: str, timeframe: str, days: int
+) -> pd.DataFrame:
+    """Stored candles for the last `days`, as floats indexed by timestamp."""
+    start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+    q = (
+        select(MarketCandle.timestamp, *(getattr(MarketCandle, c) for c in COLUMNS[1:]))
+        .where(*_where(symbol, timeframe), MarketCandle.timestamp >= start)
+        .order_by(MarketCandle.timestamp)
+    )
+    rows = (await session.execute(q)).all()
+    df = pd.DataFrame(rows, columns=COLUMNS).set_index("timestamp")
+    return df.astype(float)
 
 
 async def backfill(
@@ -53,8 +71,18 @@ async def backfill(
     """Seed closed candles via REST, resuming from the newest stored one. Returns rows written."""
     tf_ms = gw.timeframe_ms(timeframe)
     now = int(time.time() * 1000)
-    last = await latest_timestamp(session, symbol, timeframe)
-    since = int(last.timestamp() * 1000) if last else now - days * 86_400_000
+    start = now - days * 86_400_000
+    span = (
+        await session.execute(
+            select(func.min(MarketCandle.timestamp), func.max(MarketCandle.timestamp)).where(
+                *_where(symbol, timeframe)
+            )
+        )
+    ).one()
+    # Resume after the newest candle if storage already covers `start`; otherwise fetch from
+    # `start` (overlapping rows are upserted, so re-fetching is harmless).
+    covered = span[0] is not None and span[0].timestamp() * 1000 <= start + tf_ms
+    since = int(span[1].timestamp() * 1000) if covered else start
     written = 0
     while since < now:
         page = await gw.fetch_ohlcv(symbol, timeframe, since, PAGE)

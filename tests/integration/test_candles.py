@@ -52,5 +52,13 @@ async def test_backfill_paginates_skips_forming_candle_and_is_idempotent(
     assert await _count(session) == 2499
 
     # Re-run resumes from the newest stored candle and writes no duplicates.
-    await backfill(gw, session, SYM, TF, days=200)  # type: ignore[arg-type]
+    assert await backfill(gw, session, SYM, TF, days=100) <= 1  # type: ignore[arg-type]
     assert await _count(session) == 2499
+
+
+async def test_backfill_extends_history_backwards(session: AsyncSession) -> None:
+    gw = FakeGateway(n=2500)
+    await backfill(gw, session, SYM, TF, days=10)  # type: ignore[arg-type]
+    assert await _count(session) == 10 * 24 - 1
+    await backfill(gw, session, SYM, TF, days=50)  # type: ignore[arg-type]
+    assert await _count(session) == 50 * 24 - 1
