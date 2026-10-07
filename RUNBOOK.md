@@ -39,6 +39,9 @@ ruff check .
 
 ## 4. Operational Commands
 ```bash
+# 0. Seed historical 15m + 1h candles from Binance (resumes from the newest stored candle)
+python -m src.main backfill --symbol BTC/USDT --days 60
+
 # 1. Backtest a strategy with VectorBT
 python -m src.main backtest --symbol BTC/USDT --timeframe 1h --days 60
 

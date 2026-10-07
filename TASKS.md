@@ -14,11 +14,11 @@ Rules for the Agent:
   - [x] Create `trade_signals` model to store historical JSON signal dispatches.
   - [x] Create `active_positions` model and implement a startup initialization script to query it on boot to rebuild the bot's live trading state (Crash Recovery).
 
-- [ ] **Phase 2: Live Market Data Pipeline (`ccxt.pro`)**
-  - [ ] Implement `ExchangeGateway` class using async `ccxt.pro` WebSockets to maintain a zero-latency local price book.
-  - [ ] Build historical candle backfiller (REST) for seeding TimescaleDB with past 15m and 1h Klines from Binance.
-  - [ ] Implement live ingestion loop using `ccxt.watch_ohlcv()` to listen for candle closes, persist them to TimescaleDB, and trigger the Strategy Engine.
-  - [ ] Write integration test verifying candles are correctly written and deduplicated in TimescaleDB.
+- [x] **Phase 2: Live Market Data Pipeline (`ccxt.pro`)**
+  - [x] Implement `ExchangeGateway` class using async `ccxt.pro` WebSockets to maintain a zero-latency local price book.
+  - [x] Build historical candle backfiller (REST) for seeding TimescaleDB with past 15m and 1h Klines from Binance.
+  - [x] Implement live ingestion loop using `ccxt.watch_ohlcv()` to listen for candle closes, persist them to TimescaleDB, and trigger the Strategy Engine.
+  - [x] Write integration test verifying candles are correctly written and deduplicated in TimescaleDB.
 
 - [ ] **Phase 3: Vectorized Strategy Engine**
   - [ ] Define `BaseStrategy` abstract interface with vectorized evaluation logic.

@@ -1,4 +1,3 @@
-from collections.abc import AsyncIterator
 from decimal import Decimal
 
 import pytest
@@ -6,19 +5,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.db import engine
 from src.core.recovery import load_active_positions
 from src.models import ActivePosition
-
-
-@pytest.fixture
-async def session() -> AsyncIterator[AsyncSession]:
-    # Each test runs inside a transaction that is rolled back.
-    async with engine.connect() as conn:
-        trans = await conn.begin()
-        async with AsyncSession(bind=conn, join_transaction_mode="create_savepoint") as s:
-            yield s
-        await trans.rollback()
 
 
 def _position(**kw: str) -> ActivePosition:
