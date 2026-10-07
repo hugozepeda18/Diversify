@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import ccxt.pro as ccxtpro
@@ -27,12 +28,16 @@ class ExchangeGateway:
     def timeframe_ms(self, timeframe: str) -> int:
         return int(self.exchange.parse_timeframe(timeframe)) * 1000
 
-    async def stream_prices(self, symbol: str) -> None:
-        """Keep `self.prices[symbol]` fresh forever; run as a background task."""
+    async def stream_prices(
+        self, symbol: str, on_tick: Callable[[str, float], Awaitable[None]] | None = None
+    ) -> None:
+        """Keep `self.prices[symbol]` fresh forever (~1 update/s); run as a background task."""
         while True:
             try:
                 ticker = await self.exchange.watch_ticker(symbol)
-                self.prices[symbol] = float(ticker["last"])
+                self.prices[symbol] = price = float(ticker["last"])
+                if on_tick is not None:
+                    await on_tick(symbol, price)
             except Exception:  # ccxt.pro reconnects on the next watch call
                 log.exception("ticker stream error for %s, retrying", symbol)
                 await asyncio.sleep(1)

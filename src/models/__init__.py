@@ -26,7 +26,7 @@ class MarketCandle(Base):
     high: Mapped[Decimal] = mapped_column(Price)
     low: Mapped[Decimal] = mapped_column(Price)
     close: Mapped[Decimal] = mapped_column(Price)
-    volume: Mapped[Decimal] = mapped_column(Price)
+    volume: Mapped[Decimal] = mapped_column(Numeric(30, 8))  # meme coins trade >1e10 units
 
 
 class TradeSignal(Base):

@@ -1,24 +1,28 @@
 import argparse
 import asyncio
-import json
 import logging
 import signal
 
 import pandas as pd
 
-from src.backtest import optimize, run_backtest
+from src.backtest import optimize, rank_across, run_backtest
 from src.core.config import settings
 from src.core.db import SessionLocal, engine
 from src.core.recovery import load_active_positions
 from src.core.risk import RiskManager
 from src.data.candles import backfill, ingest_live, load_candles
 from src.data.gateway import ExchangeGateway
-from src.signals import process_close
+from src.signals import SignalEngine
 from src.strategies import STRATEGIES
 
 log = logging.getLogger("trading-bot")
 # ~4 years: spans the 2022 bear, 2023 chop and 2024-25 bull, so a strategy is judged across regimes.
 HISTORY_DAYS = 1460
+# Top 10 non-stablecoins by market cap on Binance spot with 4y of history (CoinGecko, 2026-10-07).
+# Skipped: HYPE (listed on Binance 2026-09-24, no history), XMR (not on Binance spot).
+TOP_COINS = [
+    f"{c}/USDT" for c in ("BTC", "ETH", "BNB", "XRP", "SOL", "TRX", "ZEC", "DOGE", "LINK", "ADA")
+]
 
 
 async def startup() -> None:
@@ -53,66 +57,64 @@ async def run_backtest_cmd(args: argparse.Namespace) -> None:
 
 
 async def run_optimize_cmd(args: argparse.Namespace) -> None:
-    cols = ["sharpe_ratio", "total_return_pct", "max_drawdown_pct", "trades"]
+    classes = list(dict.fromkeys(STRATEGIES[name] for name in args.strategy))  # dedupe aliases
     for tf in args.timeframe:
-        await run_backfill(args.symbol, tf, args.days)
-        async with SessionLocal() as session:
-            candles = await load_candles(session, args.symbol, tf, args.days)
-        res = optimize(STRATEGIES[args.strategy], candles, tf, args.split, args.fees)
-        bh = {w: res[f"{w}_buy_hold_return_pct"].iloc[0] for w in ("train", "test")}
+        per_coin, bh = [], {}
+        for symbol in args.symbol:
+            await run_backfill(symbol, tf, args.days)
+            async with SessionLocal() as session:
+                candles = await load_candles(session, symbol, tf, args.days)
+            for cls in classes:
+                res = optimize(cls, candles, tf, args.split, args.fees).assign(symbol=symbol)
+                per_coin.append(res)
+            bh[symbol] = res["test_buy_hold_return_pct"].iloc[0]
+        ranked = rank_across(pd.concat(per_coin), args.min_trades)
         print(
-            f"\n{args.strategy} | {args.symbol} {tf} | train < {args.split} <= test | "
-            f"buy&hold train {bh['train']:.1f}% test {bh['test']:.1f}%"
+            f"\n=== {tf} | {len(args.symbol)} coin(s) | train < {args.split} <= test | "
+            f"median buy&hold test {pd.Series(bh).median():.1f}% ==="
         )
-        res = res[res["train_trades"] >= args.min_trades]
-        if res.empty:
-            print(f"  no combo made >= {args.min_trades} train trades (lower --min-trades)")
+        if ranked.empty:
+            print(f"  no config made >= {args.min_trades} median train trades")
             continue
-        show = [c for c in res.columns if not c.endswith(("buy_hold_return_pct", "win_rate_pct"))]
-        show = [c for c in show if not c.startswith(("train_", "test_"))] + [
-            f"{w}_{c}" for w in ("train", "test") for c in cols
-        ]
-        print(res[show].head(args.top).round(2).to_string(index=False))
+        print(ranked.head(args.top).round(2).to_string(index=False))
+        best = ranked.groupby("strategy").head(1)  # best train config per strategy family
+        print(f"\n--- best per strategy ({tf}) ---")
+        print(best.round(2).to_string(index=False))
 
 
 async def run_monitor(args: argparse.Namespace) -> None:
-    symbol, timeframe = args.symbol, args.timeframe
     strategy = STRATEGIES[args.strategy]()
     risk = RiskManager(risk_pct=settings.risk_per_trade)
+    eng = SignalEngine(
+        SessionLocal, strategy, risk, args.timeframe, settings.account_equity_usd, args.days
+    )
     await startup()
+    await eng.load()
     gw = ExchangeGateway()
 
     async def on_candle_close(symbol: str, timeframe: str, closed: pd.DataFrame) -> None:
-        log.info("%s %s closed @ %s", symbol, timeframe, closed["close"].iloc[-1])
         try:
-            async with SessionLocal() as session:
-                candles = await load_candles(session, symbol, timeframe, args.days)
-                price = gw.prices.get(symbol, float(candles["close"].iloc[-1]))
-                payload = await process_close(
-                    session,
-                    strategy,
-                    risk,
-                    symbol,
-                    timeframe,
-                    candles,
-                    price,
-                    settings.account_equity_usd,
-                )
+            await eng.on_close(symbol, timeframe, closed, gw.prices.get(symbol))
         except Exception:  # a bad candle must not kill ingestion; the next close retries
             log.exception("signal evaluation failed for %s %s", symbol, timeframe)
-            return
-        if payload:
-            # ponytail: alert dispatch (Telegram/webhook) skipped by request; signal is in
-            # trade_signals and the log. Plug a dispatcher in here when wanted.
-            log.info("SIGNAL %s", json.dumps(payload))
 
-    log.info("monitoring %s %s with %s %s", symbol, timeframe, strategy.name, strategy.params())
+    log.info(
+        "monitoring %d coin(s) %s with %s %s",
+        len(args.symbol),
+        args.timeframe,
+        strategy.name,
+        strategy.params(),
+    )
     try:
-        async with SessionLocal() as session:
-            await backfill(gw, session, symbol, timeframe, args.days)  # fill gap since last run
+        for symbol in args.symbol:
+            async with SessionLocal() as session:
+                await backfill(gw, session, symbol, args.timeframe, args.days)  # fill gaps
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(gw.stream_prices(symbol))
-            tg.create_task(ingest_live(gw, SessionLocal, symbol, timeframe, on_candle_close))
+            for symbol in args.symbol:
+                tg.create_task(gw.stream_prices(symbol, eng.on_tick))
+                tg.create_task(
+                    ingest_live(gw, SessionLocal, symbol, args.timeframe, on_candle_close)
+                )
     finally:
         await gw.close()
 
@@ -126,8 +128,9 @@ async def _run(args: argparse.Namespace) -> None:
         if args.command == "recover":
             await startup()
         elif args.command == "backfill":
-            for tf in args.timeframe:
-                await run_backfill(args.symbol, tf, args.days)
+            for symbol in args.symbol:
+                for tf in args.timeframe:
+                    await run_backfill(symbol, tf, args.days)
         elif args.command == "backtest":
             await run_backtest_cmd(args)
         elif args.command == "optimize":
@@ -146,8 +149,8 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("recover", help="Load active positions from the DB (crash recovery)")
     bf = sub.add_parser("backfill", help="Seed historical candles via REST")
-    bf.add_argument("--symbol", default="BTC/USDT")
-    bf.add_argument("--timeframe", nargs="+", default=["15m", "1h"])
+    bf.add_argument("--symbol", nargs="+", default=TOP_COINS)
+    bf.add_argument("--timeframe", nargs="+", default=["15m", "1h", "4h", "1d"])
     bf.add_argument("--days", type=int, default=HISTORY_DAYS)
     bt = sub.add_parser("backtest", help="Backtest a strategy on stored candles")
     bt.add_argument("--strategy", choices=STRATEGIES, default="DoubleEma")
@@ -157,19 +160,17 @@ def main() -> None:
     bt.add_argument("--no-risk", action="store_true", help="Disable SL/TP and risk sizing")
     bt.add_argument("--fees", type=float, default=0.001, help="Fee per fill (0.001 = 0.1%%)")
     op = sub.add_parser("optimize", help="Grid-search params on train, report on test")
-    op.add_argument("--strategy", choices=STRATEGIES, default="DonchianBreakout")
-    op.add_argument("--symbol", default="BTC/USDT")
+    op.add_argument("--strategy", nargs="+", choices=STRATEGIES, default=list(STRATEGIES))
+    op.add_argument("--symbol", nargs="+", default=TOP_COINS)
     op.add_argument("--timeframe", nargs="+", default=["15m", "1h", "4h", "1d"])
     op.add_argument("--days", type=int, default=HISTORY_DAYS)
     op.add_argument("--split", default="2025-01-01", help="Train before, test from this date")
     op.add_argument("--fees", type=float, default=0.001)
-    op.add_argument(
-        "--min-trades", type=int, default=20, help="Drop combos with fewer train trades"
-    )
+    op.add_argument("--min-trades", type=int, default=10, help="Min median train trades per coin")
     op.add_argument("--top", type=int, default=10)
     mon = sub.add_parser("monitor", help="Live signal engine: candles -> strategy -> risk -> DB")
     mon.add_argument("--strategy", choices=STRATEGIES, default="DoubleEmaCross")
-    mon.add_argument("--symbol", default="BTC/USDT")
+    mon.add_argument("--symbol", nargs="+", default=TOP_COINS)
     mon.add_argument("--timeframe", default="4h")
     mon.add_argument("--days", type=int, default=365, help="History loaded for indicator warm-up")
     try:

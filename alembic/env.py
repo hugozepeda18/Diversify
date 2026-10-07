@@ -30,6 +30,18 @@ target_metadata = Base.metadata
 # ... etc.
 
 
+def include_object(
+    obj: object, name: str | None, type_: str, reflected: bool, compare_to: object
+) -> bool:
+    # TimescaleDB creates <table>_timestamp_idx on create_hypertable; autogenerate must not drop it.
+    return not (
+        type_ == "index"
+        and reflected
+        and compare_to is None
+        and name == "market_candles_timestamp_idx"
+    )
+
+
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.
 
@@ -55,7 +67,9 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection, target_metadata=target_metadata, include_object=include_object
+    )
 
     with context.begin_transaction():
         context.run_migrations()

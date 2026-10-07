@@ -8,7 +8,12 @@ from src.strategies import (
     BaseStrategy,
     DonchianBreakout,
     DoubleEmaCross,
+    KeltnerBreakout,
+    MaSlope,
+    RibbonScore,
     RsiThreshold,
+    SmaRegime,
+    TripleMa,
 )
 
 
@@ -70,7 +75,13 @@ ALL = [
     RsiThreshold(trend=50),
     DonchianBreakout(),
     DonchianBreakout(trend=0),
+    SmaRegime(window=50, band=0.02),
+    TripleMa(fast=5, mid=20, slow=50),
+    MaSlope(window=20, lookback=5),
+    RibbonScore(),
+    KeltnerBreakout(window=20, mult=1.0),
 ]
+MA_FAMILY = ALL[-5:]
 
 
 @pytest.mark.parametrize("strategy", ALL)
@@ -151,8 +162,28 @@ def test_optimize_skips_invalid_and_reports_train_and_test() -> None:
     res = optimize(DoubleEmaCross, NOISE, "1h", str(NOISE.index[300]), 0.001)
     valid = sum(f < s for f in DoubleEmaCross.GRID["fast"] for s in DoubleEmaCross.GRID["slow"])
     assert len(res) == valid * len(DoubleEmaCross.GRID["trend"]) * len(RISK_GRID)
-    assert (res["fast"] < res["slow"]).all()
+    fast_slow = res["params"].str.extract(r"fast=(\d+) slow=(\d+)").astype(int)
+    assert (fast_slow[0] < fast_slow[1]).all()
+    assert set(res["risk"]) == {"2xATR/2R", "3xATR/3R", "3xATR/10R", "5xATR/10R", "all-in"}
     assert {"train_sharpe_ratio", "test_sharpe_ratio"} <= set(res.columns)
+
+
+def test_rank_across_aggregates_per_config_over_coins() -> None:
+    from src.backtest import optimize, rank_across
+
+    split = str(NOISE.index[300])
+    other = candles(NOISE["close"].to_numpy()[::-1].copy())  # a second "coin"
+    res = pd.concat(
+        [
+            optimize(SmaRegime, c, "1h", split, 0.001).assign(symbol=n)
+            for n, c in [("A", NOISE), ("B", other)]
+        ]
+    )
+    ranked = rank_across(res, min_trades=0)
+    assert (ranked["coins"] == 2).all()
+    assert len(ranked) == len(res) // 2
+    assert ranked["test_profitable_pct"].between(0, 100).all()
+    assert ranked["train_sharpe"].is_monotonic_decreasing
 
 
 @pytest.mark.parametrize("strategy", ALL)
@@ -163,3 +194,28 @@ def test_live_lag0_matches_backtest_next_row(strategy: BaseStrategy) -> None:
         backtest = strategy.evaluate(NOISE.iloc[: t + 2])
         assert live.entries.iloc[-1] == backtest.entries.iloc[t + 1]
         assert live.exits.iloc[-1] == backtest.exits.iloc[t + 1]
+
+
+LONG_V = candles(np.r_[np.linspace(200, 100, 300), np.linspace(100, 200, 300)])  # bottom @299
+LONG_A = candles(np.r_[np.linspace(100, 200, 300), np.linspace(200, 100, 300)])  # top @299
+
+
+@pytest.mark.parametrize("strategy", MA_FAMILY, ids=lambda s: s.name)
+def test_ma_family_buys_uptrends_and_sells_downtrends(strategy: BaseStrategy) -> None:
+    v, a = strategy.evaluate(LONG_V), strategy.evaluate(LONG_A)
+    assert v.entries.any() and not v.entries.iloc[:300].any()  # never buys the decline
+    assert a.exits.iloc[300:].any() and not a.entries.iloc[310:].any()  # sells the decline
+    assert not (v.entries & v.exits).any()
+
+
+def test_ribbon_score_is_share_of_emas_below_close() -> None:
+    score = RibbonScore().indicators(LONG_V)["score"]
+    assert score.iloc[:199].isna().all()  # NaN until every EMA has its warm-up
+    assert score.iloc[250:299].eq(0).all() and score.iloc[-1] == 1.0
+
+
+def test_new_strategies_reject_invalid_params() -> None:
+    with pytest.raises(ValueError):
+        TripleMa(fast=50, mid=20, slow=100)
+    with pytest.raises(ValueError):
+        RibbonScore(enter=0.3, exit=0.5)

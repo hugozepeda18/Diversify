@@ -8,7 +8,14 @@ from src.core.risk import RiskManager
 from src.strategies import BaseStrategy
 
 # (atr_mult, reward_ratio) pairs searched by `optimize`; wide R:R ~ let winners run.
-RISK_GRID = [(2.0, 2.0), (3.0, 3.0), (3.0, 10.0), (5.0, 10.0)]
+# None = all-in, no stops: the plain-exposure benchmark (e.g. SmaRegime 200d all-in).
+RISK_GRID: list[tuple[float, float] | None] = [
+    (2.0, 2.0),
+    (3.0, 3.0),
+    (3.0, 10.0),
+    (5.0, 10.0),
+    None,
+]
 
 
 def run_backtest(
@@ -81,17 +88,43 @@ def optimize(
             strategy = cls(**params)
         except ValueError:  # invalid combo, e.g. fast >= slow
             continue
-        for atr_mult, rr in RISK_GRID:
-            risk = RiskManager(atr_mult=atr_mult, reward_ratio=rr)
+        for stops in RISK_GRID:
+            risk = None if stops is None else RiskManager(atr_mult=stops[0], reward_ratio=stops[1])
             train = run_backtest(strategy, candles, timeframe, fees, risk=risk, end=split)
             test = run_backtest(strategy, candles, timeframe, fees, risk=risk, start=split)
             rows.append(
                 {
-                    **params,
-                    "atr_mult": atr_mult,
-                    "rr": rr,
+                    "strategy": cls.name,
+                    "params": " ".join(f"{k}={v:g}" for k, v in params.items()),
+                    "risk": "all-in" if stops is None else f"{stops[0]:g}xATR/{stops[1]:g}R",
                     **{f"train_{k}": v for k, v in train.items()},
                     **{f"test_{k}": v for k, v in test.items()},
                 }
             )
     return pd.DataFrame(rows).sort_values("train_sharpe_ratio", ascending=False)
+
+
+def rank_across(results: pd.DataFrame, min_trades: int) -> pd.DataFrame:
+    """Collapse per-symbol `optimize` rows into one row per config, judged across all coins.
+
+    A real edge should hold on most coins with the same parameters, so rank by the *median*
+    train Sharpe and show how many coins stayed profitable / beat buy & hold out-of-sample.
+    """
+    r = results.assign(
+        test_profitable=results["test_total_return_pct"] > 0,
+        test_beats_bh=results["test_total_return_pct"] > results["test_buy_hold_return_pct"],
+    )
+    out = r.groupby(["strategy", "params", "risk"]).agg(
+        coins=("train_trades", "size"),
+        train_trades=("train_trades", "median"),
+        train_sharpe=("train_sharpe_ratio", "median"),
+        train_return=("train_total_return_pct", "median"),
+        test_sharpe=("test_sharpe_ratio", "median"),
+        test_return=("test_total_return_pct", "median"),
+        test_max_dd=("test_max_drawdown_pct", "median"),
+        test_profitable_pct=("test_profitable", "mean"),
+        test_beats_bh_pct=("test_beats_bh", "mean"),
+    )
+    out[["test_profitable_pct", "test_beats_bh_pct"]] *= 100
+    out = out[out["train_trades"] >= min_trades]
+    return out.sort_values("train_sharpe", ascending=False).reset_index()

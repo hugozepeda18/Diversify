@@ -44,3 +44,62 @@ async def test_entry_then_stop_loss_round_trip(session: AsyncSession) -> None:
         await session.scalars(select(TradeSignal.action).where(TradeSignal.symbol == SYM))
     ).all()
     assert sorted(actions) == ["ENTER_LONG", "EXIT_LONG"]
+
+
+async def _enter(session: AsyncSession, **kw: float) -> dict:  # type: ignore[type-arg]
+    k = int(STRAT.evaluate(V, lag=0).entries.to_numpy().argmax())
+    c = V.iloc[: k + 1]
+    price = float(c["close"].iloc[-1])
+    out = await process_close(session, STRAT, RISK, SYM, TF, c, price, 10_000.0, **kw)
+    assert out is not None
+    return out
+
+
+async def test_tick_exit_fills_at_actual_price_not_stop_level(session: AsyncSession) -> None:
+    from src.signals import exit_on_price
+
+    rm = (await _enter(session))["risk_management"]
+    inside = (rm["stop_loss"] + rm["take_profit"]) / 2
+    assert await exit_on_price(session, STRAT.name, SYM, TF, inside) is None
+    gap = rm["stop_loss"] * 0.97  # price gapped 3% through the stop
+    out = await exit_on_price(session, STRAT.name, SYM, TF, gap)
+    assert out is not None and out["reason"] == "stop_loss"
+    assert out["trigger_price"] == round(gap, 8)  # real slippage recorded
+    assert await exit_on_price(session, STRAT.name, SYM, TF, gap) is None  # already flat
+
+
+async def test_entry_capped_by_free_equity(session: AsyncSession) -> None:
+    assert (await _enter(session, max_size_usd=123.0))["risk_management"][
+        "position_size_usd"
+    ] == 123.0
+
+
+async def test_entry_skipped_when_equity_fully_used(session: AsyncSession) -> None:
+    k = int(STRAT.evaluate(V, lag=0).entries.to_numpy().argmax())
+    c = V.iloc[: k + 1]
+    out = await process_close(session, STRAT, RISK, SYM, TF, c, 100.0, 10_000.0, max_size_usd=0)
+    assert out is None
+    assert await session.scalar(select(ActivePosition).where(ActivePosition.symbol == SYM)) is None
+
+
+async def test_engine_recovers_book_and_exits_on_tick(session: AsyncSession) -> None:
+    from contextlib import asynccontextmanager
+    from typing import Any
+
+    from src.signals import SignalEngine
+
+    rm = (await _enter(session))["risk_management"]
+
+    @asynccontextmanager
+    async def sessions() -> Any:
+        yield session
+
+    eng = SignalEngine(sessions, STRAT, RISK, TF, 10_000.0, days=30)  # type: ignore[arg-type]
+    await eng.load()  # simulated restart: book rebuilt from active_positions
+    assert eng.book[SYM][:2] == (rm["stop_loss"], rm["take_profit"])
+    await eng.on_tick(SYM, rm["take_profit"] + 1)
+    assert SYM not in eng.book
+    last = await session.scalar(
+        select(TradeSignal).where(TradeSignal.symbol == SYM).order_by(TradeSignal.timestamp.desc())
+    )
+    assert last is not None and last.payload["reason"] == "take_profit"
