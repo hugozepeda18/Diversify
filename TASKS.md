@@ -37,3 +37,8 @@ Rules for the Agent:
   - [ ] ~~Implement `SignalDispatcher`~~ (skipped by request: no alerts): Telegram Bot API client using `httpx`, with a generic HTTP Webhook POST fallback.
   - [ ] ~~Add CLI command `test-alert`~~ (skipped by request: no alerts) to verify your receiving endpoint receives the formatted JSON payload.
   - [x] Implement live monitoring daemon: loops on candle close -> evaluates strategy -> calculates risk -> saves position to DB -> ~~dispatches JSON alert~~ logs JSON + stores it in `trade_signals`.
+- [x] **Phase 6: Exchange Execution (Binance Demo Trading)**
+  - [x] `BinanceDemoBroker`: market entry sized by risk, net-of-fee quantity, exchange-side OCO (LIMIT_MAKER TP + STOP_LOSS market SL).
+  - [x] Orders placed before the DB commit; failed orders record nothing; failed OCO sells the entry back.
+  - [x] Exchange sync loop: records OCO fills (also after downtime) and re-places manually cancelled OCOs.
+  - [x] `monitor --execute` and read-only `broker-check`; verified end-to-end on Binance Demo.

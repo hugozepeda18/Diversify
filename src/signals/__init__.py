@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.risk import RiskManager, RiskPlan
 from src.data.candles import load_candles
+from src.execution import BinanceDemoBroker
 from src.models import ActivePosition, TradeSignal
 from src.strategies import BaseStrategy
 
@@ -80,6 +81,7 @@ async def _record(
     plan: RiskPlan,
     snapshot: dict[str, float],
     reason: str | None = None,
+    execution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = build_payload(
         timestamp=decided_at,
@@ -92,6 +94,8 @@ async def _record(
         indicators=snapshot,
         reason=reason,
     )
+    if execution is not None:
+        payload["execution"] = execution  # what the exchange actually did
     session.add(
         TradeSignal(
             timestamp=decided_at,
@@ -118,23 +122,34 @@ async def exit_on_price(
         return None
     plan = _plan(position)
     if price <= plan.stop_loss:
-        reason = "stop_loss"
-    elif price >= plan.take_profit:
-        reason = "take_profit"
-    else:
-        return None
+        return await close_position(session, position, price, "stop_loss")
+    if price >= plan.take_profit:
+        return await close_position(session, position, price, "take_profit")
+    return None
+
+
+async def close_position(
+    session: AsyncSession,
+    position: ActivePosition,
+    fill: float,
+    reason: str,
+    execution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Delete the position and record the EXIT_LONG signal (outside a candle close)."""
+    plan = _plan(position)
     await session.delete(position)
     return await _record(
         session,
         decided_at=datetime.now(UTC),
-        strategy=strategy,
-        symbol=symbol,
-        timeframe=timeframe,
+        strategy=position.strategy_name,
+        symbol=position.symbol,
+        timeframe=position.timeframe,
         action="EXIT_LONG",
-        fill=price,
+        fill=fill,
         plan=plan,
         snapshot={},
         reason=reason,
+        execution=execution,
     )
 
 
@@ -148,6 +163,7 @@ async def process_close(
     price: float,
     equity: float,
     max_size_usd: float | None = None,
+    broker: BinanceDemoBroker | None = None,
 ) -> dict[str, Any] | None:
     """Act on the newest closed candle (last row of `candles`); persist and return any signal.
 
@@ -155,6 +171,10 @@ async def process_close(
     low/high, a fallback for ticks missed while offline) or the strategy's exit; otherwise an
     entry signal opens one at `price` (live price ~ next bar's open), capped at `max_size_usd`.
     State lives in the DB, so a restart resumes cleanly.
+
+    With a `broker`, orders go to the exchange *before* the DB commit: if an order fails the
+    exception propagates and nothing is recorded. Exchange-held positions skip the candle
+    SL/TP check; their OCO fills are synced by `SignalEngine.sync_exchange`.
     """
     last = candles.iloc[-1]
     decided_at = candles.index[-1] + pd.Timedelta(seconds=ccxt.Exchange.parse_timeframe(timeframe))
@@ -162,15 +182,23 @@ async def process_close(
     row = strategy.frame(candles).iloc[-1].drop("close", errors="ignore")
     snapshot = {str(k): float(v) for k, v in row.items()}
     position = await get_position(session, strategy.name, symbol, timeframe)
+    execution: dict[str, Any] | None = None
     if position is not None:
         plan = _plan(position)
+        on_exchange = position.exchange_ref is not None
         # ponytail: SL checked before TP when one candle spans both (pessimistic, like vbt).
-        if last["low"] <= plan.stop_loss:
+        if not on_exchange and last["low"] <= plan.stop_loss:
             reason, fill = "stop_loss", plan.stop_loss
-        elif last["high"] >= plan.take_profit:
+        elif not on_exchange and last["high"] >= plan.take_profit:
             reason, fill = "take_profit", plan.take_profit
         elif signals.exits.iloc[-1]:
             reason, fill = "signal", price
+            if on_exchange:
+                if broker is None:
+                    raise RuntimeError(f"{symbol} position lives on the exchange; run --execute")
+                assert position.quantity is not None and position.exchange_ref is not None
+                sold = await broker.exit(symbol, float(position.quantity), position.exchange_ref)
+                execution = {"price": sold, "quantity": float(position.quantity)}
         else:
             return None
         action = "EXIT_LONG"
@@ -183,16 +211,28 @@ async def process_close(
                 log.warning("skip %s entry: open positions already use all equity", symbol)
                 return None
             plan = plan._replace(position_size_usd=min(plan.position_size_usd, max_size_usd))
+        entry_price, quantity, ref = price, None, None
+        if broker is not None:
+            done = await broker.enter(symbol, plan, price)
+            plan = plan._replace(
+                stop_loss=done.stop_loss,
+                take_profit=done.take_profit,
+                position_size_usd=done.cost_usd,
+            )
+            entry_price, quantity, ref = done.price, done.quantity, done.ref
+            execution = done._asdict()
         session.add(
             ActivePosition(
                 strategy_name=strategy.name,
                 symbol=symbol,
                 timeframe=timeframe,
                 side="long",
-                entry_price=price,
+                entry_price=entry_price,
                 stop_loss=plan.stop_loss,
                 take_profit=plan.take_profit,
                 position_size_usd=plan.position_size_usd,
+                quantity=quantity,
+                exchange_ref=ref,
             )
         )
     else:
@@ -208,6 +248,7 @@ async def process_close(
         plan=plan,
         snapshot=snapshot,
         reason=reason,
+        execution=execution,
     )
 
 
@@ -227,9 +268,11 @@ class SignalEngine:
         timeframe: str,
         equity: float,
         days: int,
+        broker: BinanceDemoBroker | None = None,
     ) -> None:
         self.sessions, self.strategy, self.risk = sessions, strategy, risk
         self.timeframe, self.equity, self.days = timeframe, equity, days
+        self.broker = broker
         self.book: dict[str, tuple[float, float, float]] = {}
         self.lock = asyncio.Lock()  # ponytail: one lock for all symbols; fine at ~1 tick/s/coin
 
@@ -258,6 +301,8 @@ class SignalEngine:
             self.book.pop(symbol, None)
 
     async def on_tick(self, symbol: str, price: float) -> None:
+        if self.broker is not None:
+            return  # the exchange holds the stops; sync_exchange records their fills
         stops = self.book.get(symbol)
         if stops is None or stops[0] < price < stops[1]:
             return  # hot path: no position, or price inside the SL/TP band
@@ -274,6 +319,10 @@ class SignalEngine:
         async with self.lock, self.sessions() as session:
             candles = await load_candles(session, symbol, timeframe, self.days)
             in_use = sum(size for s, (_, _, size) in self.book.items() if s != symbol)
+            equity, free = self.equity, self.equity - in_use
+            if self.broker is not None:  # real account: size off the actual balance
+                cash = await self.broker.free_usdt()
+                equity, free = cash + in_use, cash * 0.99  # 1% buffer for price moves/fees
             payload = await process_close(
                 session,
                 self.strategy,
@@ -282,7 +331,45 @@ class SignalEngine:
                 timeframe,
                 candles,
                 price if price is not None else float(candles["close"].iloc[-1]),
-                self.equity,
-                max_size_usd=self.equity - in_use,
+                equity,
+                max_size_usd=free,
+                broker=self.broker,
             )
             self._sync(symbol, payload)
+
+    async def sync_exchange(self) -> None:
+        """Record exchange-side OCO fills (incl. ones that fired while the bot was offline)."""
+        assert self.broker is not None
+        async with self.lock, self.sessions() as session:
+            rows = await session.scalars(
+                select(ActivePosition).where(
+                    ActivePosition.strategy_name == self.strategy.name,
+                    ActivePosition.timeframe == self.timeframe,
+                    ActivePosition.exchange_ref.is_not(None),
+                )
+            )
+            for p in list(rows):
+                symbol, ref, qty = p.symbol, p.exchange_ref, p.quantity  # read before commits
+                assert ref is not None and qty is not None
+                result = await self.broker.check(symbol, ref)
+                if result is None:
+                    continue
+                reason, fill = result
+                if reason == "cancelled":  # OCO removed by hand: never leave coins unprotected
+                    plan = _plan(p)
+                    p.exchange_ref = await self.broker.place_oco(
+                        symbol, float(qty), plan.stop_loss, plan.take_profit
+                    )
+                    log.warning("%s OCO was cancelled outside the bot; re-placing it", symbol)
+                    await session.commit()
+                    continue
+                payload = await close_position(session, p, fill, reason, {"price": fill})
+                self._sync(symbol, payload)
+
+    async def run_exchange_sync(self, every: float = 30.0) -> None:
+        while True:
+            try:
+                await self.sync_exchange()
+            except Exception:  # transient API errors: retry next round
+                log.exception("exchange sync failed")
+            await asyncio.sleep(every)

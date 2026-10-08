@@ -57,4 +57,7 @@ class ActivePosition(Base):
     stop_loss: Mapped[Decimal] = mapped_column(Price)
     take_profit: Mapped[Decimal] = mapped_column(Price)
     position_size_usd: Mapped[Decimal] = mapped_column(Price)
+    # Set only when a broker executed the entry: coins held and the exchange-side OCO (SL/TP).
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(30, 8))
+    exchange_ref: Mapped[str | None] = mapped_column(String(64))
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

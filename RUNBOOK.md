@@ -55,4 +55,10 @@ python -m src.main optimize --strategy DoubleEmaCross --timeframe 15m 1h 4h 1d -
 # 3. Start live ingestion + signal engine (defaults: DoubleEmaCross 20/200, 4h, 5xATR SL, 10R TP).
 #    Signals are logged as "SIGNAL {json}" and stored in trade_signals; open trades in active_positions.
 python -m src.main monitor --symbol BTC/USDT --timeframe 4h
+
+# 4. Execute on Binance Demo Trading (real prices, fake funds). Needs BINANCE_TESTNET_API_KEY /
+#    BINANCE_TESTNET_SECRET in .env (HMAC keys from demo.binance.com). Each entry = market buy +
+#    exchange-side OCO (SL/TP), so stops fire even while the bot is down; fills are synced every 30s.
+python -m src.main broker-check          # read-only: demo balance + exchange status of positions
+python -m src.main monitor --execute     # top-10 coins, 4h, real demo orders
 ```

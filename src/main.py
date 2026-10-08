@@ -12,6 +12,7 @@ from src.core.recovery import load_active_positions
 from src.core.risk import RiskManager
 from src.data.candles import backfill, ingest_live, load_candles
 from src.data.gateway import ExchangeGateway
+from src.execution import BinanceDemoBroker
 from src.signals import SignalEngine
 from src.strategies import STRATEGIES
 
@@ -82,11 +83,46 @@ async def run_optimize_cmd(args: argparse.Namespace) -> None:
         print(best.round(2).to_string(index=False))
 
 
+def make_broker() -> BinanceDemoBroker:
+    key, secret = settings.binance_testnet_api_key, settings.binance_testnet_secret
+    if key is None or secret is None:
+        raise SystemExit("set BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_SECRET in .env")
+    return BinanceDemoBroker(key.get_secret_value(), secret.get_secret_value())
+
+
+async def run_broker_check() -> None:
+    """Read-only: demo balance plus the exchange status of every exchange-held position."""
+    broker = make_broker()
+    try:
+        print(f"Binance Demo free USDT: {await broker.free_usdt():.2f}")
+        async with SessionLocal() as session:
+            positions = (await load_active_positions(session)).values()
+        for p in positions:
+            if p.exchange_ref is None:
+                print(f"  {p.symbol} {p.timeframe} {p.strategy_name}: virtual (no exchange order)")
+                continue
+            status = await broker.check(p.symbol, p.exchange_ref)
+            print(
+                f"  {p.symbol} {p.timeframe} {p.strategy_name}: qty {p.quantity} "
+                f"SL {p.stop_loss} TP {p.take_profit} OCO {p.exchange_ref} -> "
+                f"{'open' if status is None else status}"
+            )
+    finally:
+        await broker.close()
+
+
 async def run_monitor(args: argparse.Namespace) -> None:
     strategy = STRATEGIES[args.strategy]()
     risk = RiskManager(risk_pct=settings.risk_per_trade)
+    broker = make_broker() if args.execute else None
     eng = SignalEngine(
-        SessionLocal, strategy, risk, args.timeframe, settings.account_equity_usd, args.days
+        SessionLocal,
+        strategy,
+        risk,
+        args.timeframe,
+        settings.account_equity_usd,
+        args.days,
+        broker=broker,
     )
     await startup()
     await eng.load()
@@ -99,17 +135,20 @@ async def run_monitor(args: argparse.Namespace) -> None:
             log.exception("signal evaluation failed for %s %s", symbol, timeframe)
 
     log.info(
-        "monitoring %d coin(s) %s with %s %s",
+        "monitoring %d coin(s) %s with %s %s | execution: %s",
         len(args.symbol),
         args.timeframe,
         strategy.name,
         strategy.params(),
+        "Binance Demo (real orders, fake funds)" if broker else "signals only",
     )
     try:
         for symbol in args.symbol:
             async with SessionLocal() as session:
                 await backfill(gw, session, symbol, args.timeframe, args.days)  # fill gaps
         async with asyncio.TaskGroup() as tg:
+            if broker is not None:
+                tg.create_task(eng.run_exchange_sync())  # also reconciles fills from downtime
             for symbol in args.symbol:
                 tg.create_task(gw.stream_prices(symbol, eng.on_tick))
                 tg.create_task(
@@ -117,6 +156,8 @@ async def run_monitor(args: argparse.Namespace) -> None:
                 )
     finally:
         await gw.close()
+        if broker is not None:
+            await broker.close()
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -137,6 +178,8 @@ async def _run(args: argparse.Namespace) -> None:
             await run_optimize_cmd(args)
         elif args.command == "monitor":
             await run_monitor(args)
+        elif args.command == "broker-check":
+            await run_broker_check()
     finally:
         await engine.dispose()
 
@@ -173,6 +216,12 @@ def main() -> None:
     mon.add_argument("--symbol", nargs="+", default=TOP_COINS)
     mon.add_argument("--timeframe", default="4h")
     mon.add_argument("--days", type=int, default=365, help="History loaded for indicator warm-up")
+    mon.add_argument(
+        "--execute",
+        action="store_true",
+        help="Place real orders on Binance Demo Trading (keys from .env)",
+    )
+    sub.add_parser("broker-check", help="Read-only: demo balance and exchange-held positions")
     try:
         asyncio.run(_run(parser.parse_args()))
     except (KeyboardInterrupt, asyncio.CancelledError):
