@@ -103,3 +103,19 @@ async def test_engine_recovers_book_and_exits_on_tick(session: AsyncSession) -> 
         select(TradeSignal).where(TradeSignal.symbol == SYM).order_by(TradeSignal.timestamp.desc())
     )
     assert last is not None and last.payload["reason"] == "take_profit"
+
+
+def test_engines_share_equity_cap_and_lock_across_timeframes() -> None:
+    from src.signals import SignalEngine
+
+    peers: list[SignalEngine] = []
+    e2h, e4h = (
+        SignalEngine(None, STRAT, RISK, tf, 10_000.0, 30, peers=peers)  # type: ignore[arg-type]
+        for tf in ("2h", "4h")
+    )
+    assert e2h.lock is e4h.lock
+    e2h.book["BTC/USDT"] = (90.0, 120.0, 6_000.0)
+    e4h.book["ETH/USDT"] = (90.0, 120.0, 3_000.0)
+    assert e4h.in_use("SOL/USDT") == 9_000.0  # 2h positions count against 4h's free equity
+    assert e4h.in_use("ETH/USDT") == 6_000.0  # its own symbol is being re-decided
+    assert e2h.in_use("ETH/USDT") == 9_000.0  # same coin on another timeframe still counts

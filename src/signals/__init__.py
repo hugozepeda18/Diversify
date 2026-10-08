@@ -269,12 +269,18 @@ class SignalEngine:
         equity: float,
         days: int,
         broker: BinanceDemoBroker | None = None,
+        peers: "list[SignalEngine] | None" = None,
     ) -> None:
         self.sessions, self.strategy, self.risk = sessions, strategy, risk
         self.timeframe, self.equity, self.days = timeframe, equity, days
         self.broker = broker
         self.book: dict[str, tuple[float, float, float]] = {}
-        self.lock = asyncio.Lock()  # ponytail: one lock for all symbols; fine at ~1 tick/s/coin
+        # Engines for other timeframes share one account: pass the same `peers` list to all so
+        # they share the equity cap and the lock (2h and 4h candles close at the same instant).
+        self.peers = peers if peers is not None else []
+        self.peers.append(self)
+        self.lock: asyncio.Lock = self.peers[0].lock if len(self.peers) > 1 else asyncio.Lock()
+        # ponytail: one lock for all symbols and timeframes; fine at ~1 tick/s/coin
 
     async def load(self) -> None:
         """Crash recovery: rebuild the book from active_positions."""
@@ -300,6 +306,15 @@ class SignalEngine:
         else:
             self.book.pop(symbol, None)
 
+    def in_use(self, symbol: str) -> float:
+        """USD tied up in open positions across all peer engines, except this one's `symbol`."""
+        return sum(
+            size
+            for eng in self.peers
+            for s, (_, _, size) in eng.book.items()
+            if not (eng is self and s == symbol)
+        )
+
     async def on_tick(self, symbol: str, price: float) -> None:
         if self.broker is not None:
             return  # the exchange holds the stops; sync_exchange records their fills
@@ -318,7 +333,7 @@ class SignalEngine:
         log.info("%s %s closed @ %s", symbol, timeframe, closed["close"].iloc[-1])
         async with self.lock, self.sessions() as session:
             candles = await load_candles(session, symbol, timeframe, self.days)
-            in_use = sum(size for s, (_, _, size) in self.book.items() if s != symbol)
+            in_use = self.in_use(symbol)
             equity, free = self.equity, self.equity - in_use
             if self.broker is not None:  # real account: size off the actual balance
                 cash = await self.broker.free_usdt()

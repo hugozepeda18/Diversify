@@ -31,12 +31,12 @@ async def test_market_candles_is_hypertable(session: AsyncSession) -> None:
 
 
 async def test_recovery_rebuilds_positions(session: AsyncSession) -> None:
-    session.add_all([_position(), _position(strategy_name="RsiThreshold")])
+    session.add_all([_position(), _position(strategy_name="SmaRegime")])
     await session.flush()
     state = await load_active_positions(session)
     assert set(state) == {
         ("DoubleEmaCross", "BTC/USDT", "1h"),
-        ("RsiThreshold", "BTC/USDT", "1h"),
+        ("SmaRegime", "BTC/USDT", "1h"),
     }
     assert state[("DoubleEmaCross", "BTC/USDT", "1h")].entry_price == Decimal("64250.5")
 

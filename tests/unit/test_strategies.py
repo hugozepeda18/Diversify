@@ -6,14 +6,10 @@ from src.backtest import run_backtest
 from src.strategies import (
     STRATEGIES,
     BaseStrategy,
-    DonchianBreakout,
     DoubleEmaCross,
     KeltnerBreakout,
-    MaSlope,
     RibbonScore,
-    RsiThreshold,
     SmaRegime,
-    TripleMa,
 )
 
 
@@ -52,36 +48,14 @@ def test_ema_entry_is_one_bar_after_raw_cross() -> None:
     assert V.index.get_loc(s.evaluate(V).entries.idxmax()) == raw_cross + 1
 
 
-def test_rsi_threshold_matches_shifted_levels() -> None:
-    s = RsiThreshold(window=14, lower=30, upper=70)
-    rsi = s.indicators(NOISE)["rsi"].shift(1)
-    entries, exits = s.evaluate(NOISE)
-    pd.testing.assert_series_equal(entries, (rsi < 30).rename(entries.name), check_names=False)
-    pd.testing.assert_series_equal(exits, (rsi > 70).rename(exits.name), check_names=False)
-    assert entries.any() and exits.any()
-
-
-def test_rsi_v_shape_enters_on_dip_exits_on_rally() -> None:
-    entries, exits = RsiThreshold().evaluate(V)
-    assert entries.iloc[15:60].all()  # steady decline is deeply oversold
-    assert exits.iloc[75:].all()  # steady rally is deeply overbought
-    assert not (entries & exits).any()
-
-
 ALL = [
     DoubleEmaCross(),
     DoubleEmaCross(trend=50),
-    RsiThreshold(),
-    RsiThreshold(trend=50),
-    DonchianBreakout(),
-    DonchianBreakout(trend=0),
     SmaRegime(window=50, band=0.02),
-    TripleMa(fast=5, mid=20, slow=50),
-    MaSlope(window=20, lookback=5),
     RibbonScore(),
     KeltnerBreakout(window=20, mult=1.0),
 ]
-MA_FAMILY = ALL[-5:]
+MA_FAMILY = ALL[-3:]
 
 
 @pytest.mark.parametrize("strategy", ALL)
@@ -124,21 +98,15 @@ def test_cli_alias() -> None:
 def test_backtest_with_risk_stops_out_trades() -> None:
     from src.core.risk import RiskManager
 
-    plain = run_backtest(RsiThreshold(), NOISE, "1h")
-    risked = run_backtest(RsiThreshold(), NOISE, "1h", risk=RiskManager())
+    plain = run_backtest(SmaRegime(window=20), NOISE, "1h")
+    risked = run_backtest(SmaRegime(window=20), NOISE, "1h", risk=RiskManager(atr_mult=2))
     assert risked["trades"] >= plain["trades"]  # stops close trades early, freeing re-entries
     assert risked["max_drawdown_pct"] >= plain["max_drawdown_pct"]  # smaller size, shallower DD
 
 
-def test_donchian_v_shape_breaks_out_after_bottom() -> None:
-    entries, exits = DonchianBreakout(entry=20, exit=10, trend=0).evaluate(V)
-    first = V.index.get_loc(entries.idxmax())
-    assert 60 < first and entries.iloc[first:].all()  # every bar of the rally makes a new high
-    assert exits.iloc[11:60].all() and not exits.iloc[61:].any()  # new lows only in the decline
-
-
 def test_trend_filter_only_gates_entries() -> None:
-    plain, gated = RsiThreshold().evaluate(NOISE), RsiThreshold(trend=50).evaluate(NOISE)
+    plain = DoubleEmaCross(fast=5, slow=20).evaluate(NOISE)
+    gated = DoubleEmaCross(fast=5, slow=20, trend=50).evaluate(NOISE)
     assert gated.entries.sum() < plain.entries.sum()
     assert not (gated.entries & ~plain.entries).any()  # never adds entries
     assert gated.exits.equals(plain.exits)
@@ -151,8 +119,8 @@ def test_backtest_window_does_not_leak_future() -> None:
     shocked = NOISE.copy()
     shocked.iloc[300:] *= 3  # rewrite everything from the split on
     for risk in (None, RiskManager()):
-        a = run_backtest(RsiThreshold(), NOISE, "1h", risk=risk, end=split)
-        b = run_backtest(RsiThreshold(), shocked, "1h", risk=risk, end=split)
+        a = run_backtest(SmaRegime(window=20), NOISE, "1h", risk=risk, end=split)
+        b = run_backtest(SmaRegime(window=20), shocked, "1h", risk=risk, end=split)
         assert a == b
 
 
@@ -216,6 +184,6 @@ def test_ribbon_score_is_share_of_emas_below_close() -> None:
 
 def test_new_strategies_reject_invalid_params() -> None:
     with pytest.raises(ValueError):
-        TripleMa(fast=50, mid=20, slow=100)
+        DoubleEmaCross(fast=50, slow=20)
     with pytest.raises(ValueError):
         RibbonScore(enter=0.3, exit=0.5)

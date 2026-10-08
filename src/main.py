@@ -21,6 +21,8 @@ log = logging.getLogger("trading-bot")
 HISTORY_DAYS = 1460
 # Top 10 non-stablecoins by market cap on Binance spot with 4y of history (CoinGecko, 2026-10-07).
 # Skipped: HYPE (listed on Binance 2026-09-24, no history), XMR (not on Binance spot).
+# Research (2022-10..2026-10, 10 coins): 15m loses to fees, 1h is noisy, 1d trades too rarely.
+TIMEFRAMES = ["2h", "4h"]
 TOP_COINS = [
     f"{c}/USDT" for c in ("BTC", "ETH", "BNB", "XRP", "SOL", "TRX", "ZEC", "DOGE", "LINK", "ADA")
 ]
@@ -115,45 +117,56 @@ async def run_monitor(args: argparse.Namespace) -> None:
     strategy = STRATEGIES[args.strategy]()
     risk = RiskManager(risk_pct=settings.risk_per_trade)
     broker = make_broker() if args.execute else None
-    eng = SignalEngine(
-        SessionLocal,
-        strategy,
-        risk,
-        args.timeframe,
-        settings.account_equity_usd,
-        args.days,
-        broker=broker,
-    )
+    peers: list[SignalEngine] = []
+    engines = {
+        tf: SignalEngine(
+            SessionLocal,
+            strategy,
+            risk,
+            tf,
+            settings.account_equity_usd,
+            args.days,
+            broker=broker,
+            peers=peers,
+        )
+        for tf in args.timeframe
+    }
     await startup()
-    await eng.load()
+    for eng in engines.values():
+        await eng.load()
     gw = ExchangeGateway()
 
     async def on_candle_close(symbol: str, timeframe: str, closed: pd.DataFrame) -> None:
         try:
-            await eng.on_close(symbol, timeframe, closed, gw.prices.get(symbol))
+            await engines[timeframe].on_close(symbol, timeframe, closed, gw.prices.get(symbol))
         except Exception:  # a bad candle must not kill ingestion; the next close retries
             log.exception("signal evaluation failed for %s %s", symbol, timeframe)
 
+    async def on_tick(symbol: str, price: float) -> None:
+        for eng in engines.values():
+            await eng.on_tick(symbol, price)
+
     log.info(
-        "monitoring %d coin(s) %s with %s %s | execution: %s",
+        "monitoring %d coin(s) on %s with %s %s | execution: %s",
         len(args.symbol),
-        args.timeframe,
+        "+".join(engines),
         strategy.name,
         strategy.params(),
         "Binance Demo (real orders, fake funds)" if broker else "signals only",
     )
     try:
         for symbol in args.symbol:
-            async with SessionLocal() as session:
-                await backfill(gw, session, symbol, args.timeframe, args.days)  # fill gaps
+            for tf in engines:
+                async with SessionLocal() as session:
+                    await backfill(gw, session, symbol, tf, args.days)  # fill gaps
         async with asyncio.TaskGroup() as tg:
-            if broker is not None:
-                tg.create_task(eng.run_exchange_sync())  # also reconciles fills from downtime
+            if broker is not None:  # also reconciles fills from downtime
+                for eng in engines.values():
+                    tg.create_task(eng.run_exchange_sync())
             for symbol in args.symbol:
-                tg.create_task(gw.stream_prices(symbol, eng.on_tick))
-                tg.create_task(
-                    ingest_live(gw, SessionLocal, symbol, args.timeframe, on_candle_close)
-                )
+                tg.create_task(gw.stream_prices(symbol, on_tick))
+                for tf in engines:
+                    tg.create_task(ingest_live(gw, SessionLocal, symbol, tf, on_candle_close))
     finally:
         await gw.close()
         if broker is not None:
@@ -164,7 +177,10 @@ async def _run(args: argparse.Namespace) -> None:
     task = asyncio.current_task()
     assert task is not None
     # SIGTERM (docker stop, kill) cancels like Ctrl-C so the finally blocks close sockets/DB.
-    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
+    # Idempotent: a repeated SIGTERM (e.g. forwarded by `uv run`) must not cancel the cleanup.
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGTERM, lambda: None if task.cancelling() else task.cancel()
+    )
     try:
         if args.command == "recover":
             await startup()
@@ -193,19 +209,19 @@ def main() -> None:
     sub.add_parser("recover", help="Load active positions from the DB (crash recovery)")
     bf = sub.add_parser("backfill", help="Seed historical candles via REST")
     bf.add_argument("--symbol", nargs="+", default=TOP_COINS)
-    bf.add_argument("--timeframe", nargs="+", default=["15m", "1h", "4h", "1d"])
+    bf.add_argument("--timeframe", nargs="+", choices=TIMEFRAMES, default=TIMEFRAMES)
     bf.add_argument("--days", type=int, default=HISTORY_DAYS)
     bt = sub.add_parser("backtest", help="Backtest a strategy on stored candles")
     bt.add_argument("--strategy", choices=STRATEGIES, default="DoubleEma")
     bt.add_argument("--symbol", default="BTC/USDT")
-    bt.add_argument("--timeframe", default="1h")
+    bt.add_argument("--timeframe", choices=TIMEFRAMES, default="4h")
     bt.add_argument("--days", type=int, default=HISTORY_DAYS)
     bt.add_argument("--no-risk", action="store_true", help="Disable SL/TP and risk sizing")
     bt.add_argument("--fees", type=float, default=0.001, help="Fee per fill (0.001 = 0.1%%)")
     op = sub.add_parser("optimize", help="Grid-search params on train, report on test")
     op.add_argument("--strategy", nargs="+", choices=STRATEGIES, default=list(STRATEGIES))
     op.add_argument("--symbol", nargs="+", default=TOP_COINS)
-    op.add_argument("--timeframe", nargs="+", default=["15m", "1h", "4h", "1d"])
+    op.add_argument("--timeframe", nargs="+", choices=TIMEFRAMES, default=TIMEFRAMES)
     op.add_argument("--days", type=int, default=HISTORY_DAYS)
     op.add_argument("--split", default="2025-01-01", help="Train before, test from this date")
     op.add_argument("--fees", type=float, default=0.001)
@@ -214,7 +230,7 @@ def main() -> None:
     mon = sub.add_parser("monitor", help="Live signal engine: candles -> strategy -> risk -> DB")
     mon.add_argument("--strategy", choices=STRATEGIES, default="DoubleEmaCross")
     mon.add_argument("--symbol", nargs="+", default=TOP_COINS)
-    mon.add_argument("--timeframe", default="4h")
+    mon.add_argument("--timeframe", nargs="+", choices=TIMEFRAMES, default=TIMEFRAMES)
     mon.add_argument("--days", type=int, default=365, help="History loaded for indicator warm-up")
     mon.add_argument(
         "--execute",

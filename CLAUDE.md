@@ -13,5 +13,5 @@
 * Test Runner: `pytest tests/ -v`
 
 ## CLI Execution Patterns
-* Run backtest: `python -m src.main backtest --strategy DoubleEma --symbol BTC/USDT --timeframe 1h`
-* Run live signal engine: `python -m src.main monitor --symbol BTC/USDT --timeframe 15m`
+* Run backtest: `python -m src.main backtest --strategy DoubleEma --symbol BTC/USDT --timeframe 4h`
+* Run live signal engine: `python -m src.main monitor --timeframe 2h 4h` (top-10 coins; add `--execute` for Binance Demo orders)

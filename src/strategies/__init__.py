@@ -85,56 +85,6 @@ class DoubleEmaCross(BaseStrategy):
         )
 
 
-class RsiThreshold(BaseStrategy):
-    """Enter when RSI dips below `lower` (oversold), exit when it rises above `upper`."""
-
-    name = "RsiThreshold"
-    GRID: ClassVar[dict[str, list[float]]] = {
-        "lower": [25, 30, 35, 40],
-        "upper": [60, 70, 80],
-        "trend": [0, 200],
-    }
-
-    def __init__(
-        self, window: int = 14, lower: float = 30, upper: float = 70, trend: int = 0
-    ) -> None:
-        self.window, self.lower, self.upper, self.trend = window, lower, upper, trend
-
-    def indicators(self, candles: pd.DataFrame) -> pd.DataFrame:
-        return pd.DataFrame({"rsi": vbt.RSI.run(candles["close"], self.window).rsi})
-
-    def triggers(self, ind: pd.DataFrame) -> Signals:
-        return Signals(ind["rsi"] < self.lower, ind["rsi"] > self.upper)
-
-
-class DonchianBreakout(BaseStrategy):
-    """Enter on a close above the prior `entry`-bar high; exit on a close below the prior
-    `exit`-bar low (Turtle-style trend following)."""
-
-    name = "DonchianBreakout"
-    GRID: ClassVar[dict[str, list[float]]] = {
-        "entry": [20, 50, 100],
-        "exit": [10, 20, 50],
-        "trend": [0, 200],
-    }
-
-    def __init__(self, entry: int = 20, exit: int = 20, trend: int = 200) -> None:
-        self.entry, self.exit, self.trend = entry, exit, trend
-
-    def indicators(self, candles: pd.DataFrame) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "close": candles["close"],
-                # Channels exclude the current bar, else close > high-incl-close never fires.
-                "upper": candles["high"].rolling(self.entry).max().shift(1),
-                "lower": candles["low"].rolling(self.exit).min().shift(1),
-            }
-        )
-
-    def triggers(self, ind: pd.DataFrame) -> Signals:
-        return Signals(ind["close"] > ind["upper"], ind["close"] < ind["lower"])
-
-
 class SmaRegime(BaseStrategy):
     """Long while close is above its SMA ("200-day rule"), with a +/- `band` to cut whipsaws.
 
@@ -159,57 +109,6 @@ class SmaRegime(BaseStrategy):
             ind["close"] > ind["sma"] * (1 + self.band),
             ind["close"] < ind["sma"] * (1 - self.band),
         )
-
-
-class TripleMa(BaseStrategy):
-    """Long while EMAs stack fast > mid > slow (trend aligned on 3 horizons); exit on fast < mid."""
-
-    name = "TripleMa"
-    GRID: ClassVar[dict[str, list[float]]] = {
-        "fast": [5, 10, 20],
-        "mid": [20, 50, 100],
-        "slow": [100, 200, 400],
-    }
-
-    def __init__(self, fast: int = 10, mid: int = 50, slow: int = 200) -> None:
-        if not fast < mid < slow:
-            raise ValueError(f"need fast < mid < slow, got {fast}/{mid}/{slow}")
-        self.fast, self.mid, self.slow = fast, mid, slow
-
-    def indicators(self, candles: pd.DataFrame) -> pd.DataFrame:
-        close = candles["close"]
-        return pd.DataFrame(
-            {f"ema_{k}": vbt.MA.run(close, getattr(self, k), ewm=True).ma for k in self.GRID}
-        )
-
-    def triggers(self, ind: pd.DataFrame) -> Signals:
-        f, m, s = ind["ema_fast"], ind["ema_mid"], ind["ema_slow"]
-        return Signals((f > m) & (m > s), f < m)
-
-
-class MaSlope(BaseStrategy):
-    """Long while close is above a rising EMA (EMA higher than `lookback` bars ago)."""
-
-    name = "MaSlope"
-    GRID: ClassVar[dict[str, list[float]]] = {
-        "window": [50, 100, 200],
-        "lookback": [5, 10, 20],
-    }
-
-    def __init__(self, window: int = 100, lookback: int = 10) -> None:
-        self.window, self.lookback = window, lookback
-
-    def indicators(self, candles: pd.DataFrame) -> pd.DataFrame:
-        close = candles["close"]
-        ema = vbt.MA.run(close, self.window, ewm=True).ma
-        return pd.DataFrame(
-            {"close": close, "ema": ema, "ema_slope": ema - ema.shift(self.lookback)}
-        )
-
-    def triggers(self, ind: pd.DataFrame) -> Signals:
-        # Explicit comparisons, not ~above: NaN warm-up rows must stay False on both sides.
-        entries = (ind["close"] > ind["ema"]) & (ind["ema_slope"] > 0)
-        return Signals(entries, (ind["close"] < ind["ema"]) | (ind["ema_slope"] < 0))
 
 
 class RibbonScore(BaseStrategy):
@@ -267,11 +166,7 @@ class KeltnerBreakout(BaseStrategy):
 STRATEGIES: dict[str, type[BaseStrategy]] = {
     "DoubleEma": DoubleEmaCross,  # short alias used in CLAUDE.md
     "DoubleEmaCross": DoubleEmaCross,
-    "RsiThreshold": RsiThreshold,
-    "DonchianBreakout": DonchianBreakout,
     "SmaRegime": SmaRegime,
-    "TripleMa": TripleMa,
-    "MaSlope": MaSlope,
     "RibbonScore": RibbonScore,
     "KeltnerBreakout": KeltnerBreakout,
 }
